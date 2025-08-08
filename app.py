@@ -69,10 +69,7 @@ st.markdown(
 
 # Sidebar inputs
 st.sidebar.header("Data Inputs & Settings")
-# Product details inputs
-sku_input = st.sidebar.text_input("SKU", value="", help="Enter the ASIN or product SKU.")
-product_name = st.sidebar.text_input("Product Name", value="", help="Enter the product name.")
-
+# File uploads
 sales_file = st.sidebar.file_uploader("Sales history CSV", type=["csv"])
 fcst_file = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV", type=["csv"])
 projection_type = st.sidebar.selectbox("Projection Type", ["Units", "Sales $"])
@@ -102,9 +99,12 @@ if not st.button("Run Forecast"):
 
 # Display product details after forecast trigger
 if sku_input or product_name:
-    details = f"**Product Name:** {product_name or 'N/A'}
-**SKU:** {sku_input or 'N/A'}"
-    st.markdown(details)
+    # Show product details after forecast is run
+    st.markdown(
+        f"**Product Name:** {product_name or 'N/A'}  <br>"
+        f"**SKU:** {sku_input or 'N/A'}",
+        unsafe_allow_html=True
+    )
 
 # Default file paths
 default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
