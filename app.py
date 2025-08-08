@@ -198,42 +198,585 @@ def extract_product_info(upstream_path: str, is_uploaded: bool = False) -> Tuple
     
     try:
         if is_uploaded:
-            df_up_hd = pd.read_csv(upstream_path, nrows=2)  # Read 2 rows to be safe
+            df_up_hd = pd.read_csv(upstream_path, nrows=3)  # Read more rows
         else:
             if not os.path.exists(upstream_path):
                 return sku, product
-            df_up_hd = pd.read_csv(upstream_path, nrows=2)
+            df_up_hd = pd.read_csv(upstream_path, nrows=3)
         
-        # Look for SKU/ASIN columns - be more specific with search
+        # Debug: Show what columns we found
+        st.write("Debug - Found columns:", df_up_hd.columns.tolist())
+        if len(df_up_hd) > 0:
+            st.write("Debug - First row values:", df_up_hd.iloc[0].to_dict())
+        
+        # Try broader search patterns for SKU/ASIN
         sku_col = None
         name_col = None
         
+        # Look through all columns and their values
         for col in df_up_hd.columns:
             col_lower = col.lower()
-            # Look for exact matches for SKU/ASIN columns
-            if any(keyword in col_lower for keyword in ['asin', 'sku']) and not any(exclude in col_lower for exclude in ['week', 'date', 'forecast']):
-                sku_col = col
-            # Look for product name columns
-            elif any(keyword in col_lower for keyword in ['name', 'title', 'product']) and not any(exclude in col_lower for exclude in ['week', 'date', 'forecast']):
-                name_col = col
+            
+            # Check for SKU/ASIN in column name
+            if any(keyword in col_lower for keyword in ['asin', 'sku', 'id', 'item']):
+                if not any(exclude in col_lower for exclude in ['week', 'date', 'forecast', 'sales']):
+                    sku_col = col
+                    st.write(f"Debug - Found potential SKU column: {col}")
+            
+            # Check for product name in column name  
+            if any(keyword in col_lower for keyword in ['name', 'title', 'product', 'description']):
+                if not any(exclude in col_lower for exclude in ['week', 'date', 'forecast', 'sales']):
+                    name_col = col
+                    st.write(f"Debug - Found potential product column: {col}")
         
-        # Extract values from the first data row (not header)
+        # If we still haven't found anything, try looking at the actual data
+        if not sku_col and not name_col:
+            st.write("Debug - No obvious columns found, checking first few columns...")
+            for i, col in enumerate(df_up_hd.columns[:5]):  # Check first 5 columns
+                if len(df_up_hd) > 0:
+                    value = str(df_up_hd[col].iloc[0]).strip()
+                    st.write(f"Debug - Column {i} ('{col}'): '{value}'")
+                    
+                    # If it looks like a SKU/ASIN (alphanumeric, not too long)
+                    if value and value != 'nan' and len(value) < 50:
+                        if re.match(r'^[A-Z0-9\-_]+
+
+def create_xgboost_forecast(df_hist: pd.DataFrame, periods: int) -> pd.Series:
+    """Create XGBoost forecast with proper feature engineering."""
+    if not LIBRARIES['XGB'] or len(df_hist) < 4:
+        # Fallback to exponential smoothing
+        return create_exponential_smoothing_forecast(df_hist, periods)
+    
+    try:
+        # Create features
+        df_features = df_hist.copy()
+        df_features = df_features.sort_values('Week_Start')
+        
+        # Add lag features
+        for lag in [1, 2, 4]:
+            if len(df_features) > lag:
+                df_features[f'lag_{lag}'] = df_features['y'].shift(lag)
+        
+        # Add rolling statistics
+        df_features['rolling_mean_4'] = df_features['y'].rolling(window=4, min_periods=1).mean()
+        df_features['rolling_std_4'] = df_features['y'].rolling(window=4, min_periods=1).std().fillna(0)
+        
+        # Add time features
+        df_features['week_of_year'] = df_features['Week_Start'].dt.isocalendar().week
+        df_features['month'] = df_features['Week_Start'].dt.month
+        
+        # Remove rows with NaN (due to lags)
+        df_features = df_features.dropna()
+        
+        if len(df_features) < 3:
+            return create_exponential_smoothing_forecast(df_hist, periods)
+        
+        # Prepare training data
+        feature_cols = [c for c in df_features.columns if c not in ['Week_Start', 'y']]
+        X = df_features[feature_cols].fillna(0)
+        y = df_features['y']
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Train model
+        model = xgb.XGBRegressor(
+            n_estimators=50,
+            max_depth=3,
+            learning_rate=0.1,
+            random_state=42
+        )
+        model.fit(X_scaled, y)
+        
+        # Generate forecasts
+        forecasts = []
+        last_row = df_features.iloc[-1:].copy()
+        
+        for i in range(periods):
+            # Prepare features for prediction
+            X_pred = last_row[feature_cols].fillna(0)
+            X_pred_scaled = scaler.transform(X_pred)
+            
+            # Make prediction
+            pred = model.predict(X_pred_scaled)[0]
+            forecasts.append(max(pred, 0))  # Ensure non-negative
+            
+            # Update features for next prediction (simple approach)
+            if len(forecasts) >= 2:
+                last_row[feature_cols] = last_row[feature_cols].shift(1, axis=1)
+                last_row['lag_1'] = forecasts[-1]
+                if len(forecasts) >= 2:
+                    last_row['lag_2'] = forecasts[-2]
+        
+        return pd.Series(forecasts)
+    
+    except Exception as e:
+        logger.warning(f"XGBoost forecast failed: {str(e)}. Using exponential smoothing fallback.")
+        return create_exponential_smoothing_forecast(df_hist, periods)
+
+def create_exponential_smoothing_forecast(df_hist: pd.DataFrame, periods: int) -> pd.Series:
+    """Create forecast using exponential smoothing as a reliable fallback."""
+    if df_hist.empty:
+        return pd.Series([0] * periods)
+    
+    # Simple exponential smoothing with trend
+    values = df_hist['y'].values
+    alpha = 0.3
+    beta = 0.1
+    
+    if len(values) == 1:
+        return pd.Series([values[0]] * periods)
+    
+    # Initialize
+    level = values[0]
+    trend = values[1] - values[0] if len(values) > 1 else 0
+    
+    # Smooth historical data
+    for i in range(1, len(values)):
+        prev_level = level
+        level = alpha * values[i] + (1 - alpha) * (level + trend)
+        trend = beta * (level - prev_level) + (1 - beta) * trend
+    
+    # Generate forecast
+    forecasts = []
+    for i in range(periods):
+        forecast = level + (i + 1) * trend
+        forecasts.append(max(forecast, 0))  # Ensure non-negative
+    
+    return pd.Series(forecasts)
+
+def generate_forecast(df_hist: pd.DataFrame, periods: int, model_choice: str, future_idx: pd.DatetimeIndex) -> pd.DataFrame:
+    """Generate forecast using the selected model."""
+    try:
+        if model_choice == 'Prophet' and LIBRARIES['PROPHET']:
+            # Prophet forecast
+            m = Prophet(
+                weekly_seasonality=True,
+                yearly_seasonality=True if len(df_hist) > 52 else False,
+                changepoint_prior_scale=0.05
+            )
+            prophet_df = df_hist.rename(columns={'Week_Start': 'ds'})
+            m.fit(prophet_df)
+            
+            future = pd.DataFrame({'ds': future_idx})
+            forecast = m.predict(future)
+            
+            df_fc = pd.DataFrame({
+                'Week_Start': future_idx,
+                'yhat': np.maximum(forecast['yhat'].values, 0)  # Ensure non-negative
+            })
+            
+        elif model_choice == 'ARIMA' and LIBRARIES['ARIMA']:
+            # ARIMA forecast
+            tmp = df_hist.set_index('Week_Start').resample('W').sum().reset_index()
+            
+            if len(tmp) < 10:
+                # Not enough data for ARIMA, use fallback
+                forecasts = create_exponential_smoothing_forecast(df_hist, periods)
+            else:
+                try:
+                    model = ARIMA(tmp['y'], order=(1, 1, 1))
+                    fitted_model = model.fit()
+                    forecast_result = fitted_model.get_forecast(steps=periods)
+                    forecasts = np.maximum(forecast_result.predicted_mean.values, 0)
+                except:
+                    forecasts = create_exponential_smoothing_forecast(df_hist, periods)
+            
+            df_fc = pd.DataFrame({
+                'Week_Start': future_idx,
+                'yhat': forecasts
+            })
+            
+        elif model_choice == 'XGBoost':
+            # XGBoost forecast
+            forecasts = create_xgboost_forecast(df_hist, periods)
+            df_fc = pd.DataFrame({
+                'Week_Start': future_idx,
+                'yhat': forecasts.values
+            })
+            
+        else:
+            # Fallback forecast
+            forecasts = create_exponential_smoothing_forecast(df_hist, periods)
+            df_fc = pd.DataFrame({
+                'Week_Start': future_idx,
+                'yhat': forecasts.values
+            })
+        
+        logger.info(f"Generated {model_choice} forecast for {periods} periods")
+        return df_fc
+        
+    except Exception as e:
+        logger.error(f"Forecast generation failed with {model_choice}: {str(e)}")
+        # Ultimate fallback
+        forecasts = create_exponential_smoothing_forecast(df_hist, periods)
+        return pd.DataFrame({
+            'Week_Start': future_idx,
+            'yhat': forecasts.values
+        })
+
+def calculate_replenishment(forecast_df: pd.DataFrame, init_inventory: int, woc_target: int, forecast_col: str) -> pd.DataFrame:
+    """Calculate replenishment needs based on forecast."""
+    on_hand = []
+    replenishment = []
+    prev_on = init_inventory
+    
+    for _, row in forecast_df.iterrows():
+        demand = max(row[forecast_col], 0)  # Ensure non-negative demand
+        target = demand * woc_target
+        replen_needed = max(target - prev_on, 0)
+        
+        on_hand.append(int(prev_on))
+        replenishment.append(int(replen_needed))
+        
+        # Update inventory for next period
+        prev_on = prev_on + replen_needed - demand
+    
+    forecast_df = forecast_df.copy()
+    forecast_df['On_Hand_Begin'] = on_hand
+    forecast_df['Replenishment'] = replenishment
+    
+    # Calculate Weeks of Cover with safe division
+    forecast_df['Weeks_Of_Cover'] = np.where(
+        forecast_df[forecast_col] > 0,
+        (forecast_df['On_Hand_Begin'] / forecast_df[forecast_col]).round(2),
+        999.99  # Represents "infinite" weeks when demand is zero
+    )
+    
+    return forecast_df
+
+def load_amazon_sellout_forecast(upstream_path: str, is_uploaded: bool = False) -> pd.DataFrame:
+    """Load and parse Amazon sellout forecast data."""
+    if not upstream_path:
+        return pd.DataFrame()
+    
+    try:
+        if is_uploaded:
+            df_up = pd.read_csv(upstream_path, skiprows=1)
+        else:
+            if not os.path.exists(upstream_path):
+                return pd.DataFrame()
+            df_up = pd.read_csv(upstream_path, skiprows=1)
+        
+        records = []
+        current_year = datetime.now().year
+        
+        for col in df_up.columns:
+            if col.startswith('Week '):
+                # Extract date from column name
+                date_match = re.search(r"\((\d{1,2} [A-Za-z]+)", col)
+                if date_match:
+                    try:
+                        date_str = f"{date_match.group(1)} {current_year}"
+                        parsed_date = pd.to_datetime(date_str, format='%d %b %Y', errors='coerce')
+                        
+                        if parsed_date is not None:
+                            # Clean and convert value
+                            raw_value = str(df_up[col].iloc[0]) if not df_up[col].empty else "0"
+                            clean_value = re.sub(r'[^\d.]', '', raw_value.replace(',', ''))
+                            numeric_value = pd.to_numeric(clean_value, errors='coerce')
+                            
+                            if pd.notna(numeric_value):
+                                records.append({
+                                    'Week_Start': parsed_date,
+                                    'Amazon_Sellout_Forecast': int(round(numeric_value))
+                                })
+                    except Exception as e:
+                        logger.warning(f"Could not parse date from column {col}: {str(e)}")
+        
+        return pd.DataFrame(records) if records else pd.DataFrame()
+        
+    except Exception as e:
+        logger.warning(f"Could not load Amazon sellout forecast: {str(e)}")
+        return pd.DataFrame()
+
+def create_visualization(df_fc: pd.DataFrame, periods: int, projection_type: str, y_label: str):
+    """Create forecast visualization."""
+    metrics = ['Replenishment']
+    if 'Amazon_Sellout_Forecast' in df_fc.columns:
+        metrics.insert(0, 'Amazon_Sellout_Forecast')
+    
+    st.subheader(f"📊 {periods}-Week Replenishment Plan ({projection_type})")
+    
+    if LIBRARIES['PLOTLY']:
+        try:
+            fig = px.line(
+                df_fc, 
+                x='Week_Start', 
+                y=metrics,
+                labels={'value': y_label, 'variable': 'Metric'},
+                title='Replenishment vs Demand Forecast'
+            )
+            fig.update_xaxes(tickformat='%d-%m-%Y')
+            fig.update_layout(
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            logger.warning(f"Plotly chart failed: {str(e)}. Using Streamlit chart.")
+            st.line_chart(df_fc.set_index('Week_Start')[metrics])
+    else:
+        st.line_chart(df_fc.set_index('Week_Start')[metrics])
+
+def main():
+    """Main application function."""
+    # Header with branding
+    st.markdown(
+        f"""
+        <div style='display:flex; align-items:center; margin-bottom: 30px;'>
+            <img src='{CONFIG['AMAZON_BRANDING']['LOGO_URL']}' width='100' style='margin-right: 20px;'>
+            <h1 style='color:{CONFIG['AMAZON_BRANDING']['BLUE']}; margin: 0;'>
+                Amazon Replenishment Forecast
+            </h1>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+    
+    # Sidebar configuration
+    st.sidebar.header("📊 Data Inputs & Settings")
+    
+    # File uploads
+    sales_file = st.sidebar.file_uploader(
+        "📈 Sales History CSV", 
+        type=["csv"],
+        help="Upload your historical sales data CSV file"
+    )
+    
+    fcst_file = st.sidebar.file_uploader(
+        "🔮 Amazon Sell-Out Forecast CSV", 
+        type=["csv"],
+        help="Optional: Upload Amazon's sellout forecast for comparison"
+    )
+    
+    # Configuration inputs
+    projection_type = st.sidebar.selectbox(
+        "📊 Projection Type", 
+        ["Units", "Sales $"],
+        help="Choose whether to forecast in units or sales dollars"
+    )
+    
+    init_inv = st.sidebar.number_input(
+        "📦 Current On-Hand Inventory (units)", 
+        min_value=0, 
+        value=CONFIG['FORECAST_DEFAULTS']['INIT_INVENTORY'], 
+        step=1,
+        help="Current inventory level in units"
+    )
+    
+    # Model selection
+    available_models = []
+    if LIBRARIES['PROPHET']:
+        available_models.append("Prophet")
+    if LIBRARIES['ARIMA']:
+        available_models.append("ARIMA")
+    if LIBRARIES['XGB']:
+        available_models.append("XGBoost")
+    
+    # Always include fallback
+    available_models.append("Exponential Smoothing")
+    
+    if not available_models:
+        st.error("❌ No forecasting libraries available. Please install prophet, statsmodels, or xgboost.")
+        st.stop()
+    
+    model_choice = st.sidebar.selectbox(
+        "🤖 Forecast Model", 
+        available_models,
+        help="Choose the forecasting algorithm"
+    )
+    
+    # Forecast parameters
+    woc_target = st.sidebar.slider(
+        "📅 Target Weeks of Cover", 
+        CONFIG['FORECAST_DEFAULTS']['MIN_WOC'], 
+        CONFIG['FORECAST_DEFAULTS']['MAX_WOC'], 
+        CONFIG['FORECAST_DEFAULTS']['WOC_TARGET'],
+        help="Target inventory level in weeks of demand coverage"
+    )
+    
+    periods = st.sidebar.number_input(
+        "🔭 Forecast Horizon (weeks)", 
+        min_value=CONFIG['FORECAST_DEFAULTS']['MIN_PERIODS'], 
+        max_value=CONFIG['FORECAST_DEFAULTS']['MAX_PERIODS'], 
+        value=CONFIG['FORECAST_DEFAULTS']['PERIODS'],
+        help="Number of weeks to forecast ahead"
+    )
+    
+    # Validation
+    if not validate_inputs(init_inv, woc_target, periods):
+        st.stop()
+    
+    st.sidebar.markdown("---")
+    
+    # Run forecast button
+    if not st.sidebar.button("🚀 Run Forecast", type="primary"):
+        st.info("👆 Configure your settings and click **'Run Forecast'** to generate your replenishment plan.")
+        
+        # Show library status
+        with st.expander("📚 Available Libraries"):
+            for lib, available in LIBRARIES.items():
+                status = "✅ Available" if available else "❌ Not installed"
+                st.write(f"**{lib}**: {status}")
+        
+        st.stop()
+    
+    # Determine file paths
+    sales_path = sales_file if sales_file else CONFIG['DEFAULT_FILES']['SALES']
+    upstream_path = fcst_file if fcst_file else CONFIG['DEFAULT_FILES']['UPSTREAM']
+    
+    if not sales_path:
+        st.error("❌ Sales history file is required.")
+        st.stop()
+    
+    # Load and process data
+    with st.spinner('🔄 Loading and processing sales data...'):
+        df_raw = load_and_clean_sales_data(sales_path, is_uploaded=bool(sales_file))
+        
+        # Extract product information
+        sku, product = extract_product_info(upstream_path, is_uploaded=bool(fcst_file))
+        
+        # Display product info
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("📦 Product", product)
+        with col2:
+            st.metric("🏷️ SKU/ASIN", sku)
+    
+    # Determine data column
+    y_col, forecast_label, y_label = detect_column_type(df_raw, projection_type)
+    
+    # Clean historical data
+    with st.spinner('🧹 Cleaning historical data...'):
+        df_hist = pd.DataFrame({
+            'Week_Start': df_raw['Week_Start'],
+            'y': clean_numerical_data(df_raw[y_col])
+        })
+        
+        # Filter to historical data only
+        df_hist = df_hist[df_hist['Week_Start'] <= pd.to_datetime(datetime.now().date())]
+        
+        if df_hist.empty:
+            st.error("❌ No valid historical data found.")
+            st.stop()
+        
+        # Remove duplicate dates and sort
+        df_hist = df_hist.drop_duplicates(subset=['Week_Start']).sort_values('Week_Start')
+    
+    # Generate forecast
+    with st.spinner(f'🔮 Generating {model_choice} forecast...'):
+        # Create future date index
+        last_hist = df_hist['Week_Start'].max()
+        start_fc = max(
+            last_hist + timedelta(weeks=1),
+            pd.to_datetime(datetime.now().date()) + timedelta(weeks=1)
+        )
+        future_idx = pd.date_range(start=start_fc, periods=periods, freq='W')
+        
+        # Generate forecast
+        df_fc = generate_forecast(df_hist, periods, model_choice, future_idx)
+        df_fc[forecast_label] = df_fc['yhat'].round(0).astype(int)
+    
+    # Calculate replenishment
+    with st.spinner('📊 Calculating replenishment needs...'):
+        df_fc = calculate_replenishment(df_fc, init_inv, woc_target, forecast_label)
+    
+    # Load Amazon sellout forecast if available
+    if upstream_path:
+        with st.spinner('🔄 Loading Amazon sellout forecast...'):
+            amazon_forecast = load_amazon_sellout_forecast(upstream_path, is_uploaded=bool(fcst_file))
+            if not amazon_forecast.empty:
+                df_fc = df_fc.merge(amazon_forecast, on='Week_Start', how='left')
+    
+    # Format dates for display
+    df_fc['Date'] = df_fc['Week_Start'].dt.strftime('%d-%m-%Y')
+    
+    # Create visualization
+    create_visualization(df_fc, periods, projection_type, y_label)
+    
+    # Display results table
+    st.subheader("📋 Detailed Replenishment Plan")
+    
+    display_columns = ['Date', forecast_label, 'On_Hand_Begin', 'Replenishment', 'Weeks_Of_Cover']
+    if 'Amazon_Sellout_Forecast' in df_fc.columns:
+        display_columns.insert(1, 'Amazon_Sellout_Forecast')
+    
+    # Format the dataframe for better display
+    df_display = df_fc[display_columns].copy()
+    
+    # Add summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_replenishment = df_fc['Replenishment'].sum()
+        st.metric("📦 Total Replenishment", f"{total_replenishment:,} units")
+    
+    with col2:
+        avg_weekly_demand = df_fc[forecast_label].mean()
+        st.metric("📊 Avg Weekly Demand", f"{avg_weekly_demand:,.0f} units")
+    
+    with col3:
+        min_weeks_cover = df_fc['Weeks_Of_Cover'].min()
+        st.metric("⚠️ Min Weeks Cover", f"{min_weeks_cover:.1f} weeks")
+    
+    with col4:
+        max_inventory = df_fc['On_Hand_Begin'].max()
+        st.metric("📈 Peak Inventory", f"{max_inventory:,} units")
+    
+    # Display the table
+    st.dataframe(df_display, use_container_width=True)
+    
+    # Download button for results
+    csv = df_fc.to_csv(index=False)
+    st.download_button(
+        label="📥 Download Results as CSV",
+        data=csv,
+        file_name=f"replenishment_forecast_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv"
+    )
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        f"""
+        <div style='text-align:center; color:gray; margin-top:20px;'>
+            <p>📊 Generated with {model_choice} • 
+            ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')} • 
+            &copy; {datetime.now().year} Amazon Internal Tool</p>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+
+if __name__ == "__main__":
+    main(), value, re.IGNORECASE) and len(value) > 3:
+                            if not sku_col:
+                                sku_col = col
+                                st.write(f"Debug - Guessing SKU column: {col}")
+                        # If it looks like a product name (has spaces, reasonable length)
+                        elif ' ' in value and len(value) > 5:
+                            if not name_col:
+                                name_col = col  
+                                st.write(f"Debug - Guessing product column: {col}")
+        
+        # Extract the values
         if sku_col and len(df_up_hd) > 0:
             sku_value = df_up_hd[sku_col].iloc[0]
-            if pd.notna(sku_value) and str(sku_value).strip() != '':
-                # Make sure it doesn't look like a date or week reference
-                sku_str = str(sku_value).strip()
-                if not re.search(r'week|may|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|\d{1,2}\s*-\s*\d{1,2}', sku_str, re.IGNORECASE):
-                    sku = sku_str
+            if pd.notna(sku_value) and str(sku_value).strip():
+                sku = str(sku_value).strip()
+                st.write(f"Debug - Extracted SKU: '{sku}'")
         
         if name_col and len(df_up_hd) > 0:
             name_value = df_up_hd[name_col].iloc[0]
-            if pd.notna(name_value) and str(name_value).strip() != '':
-                name_str = str(name_value).strip()
-                if not re.search(r'week|may|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|\d{1,2}\s*-\s*\d{1,2}', name_str, re.IGNORECASE):
-                    product = name_str
+            if pd.notna(name_value) and str(name_value).strip():
+                product = str(name_value).strip()
+                st.write(f"Debug - Extracted Product: '{product}'")
             
     except Exception as e:
+        st.error(f"Error extracting product info: {str(e)}")
         logger.warning(f"Could not extract product info: {str(e)}")
     
     return sku, product
