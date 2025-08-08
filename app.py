@@ -205,6 +205,8 @@ if upstream_path:
     if rec:
         updf=pd.DataFrame(rec)
         df_fc=df_fc.merge(updf,on='Week_Start',how='left')
+        # Override Sell-Out Units with Amazon’s sell-out forecast
+        df_fc[forecast_label] = df_fc['Amazon_Sellout_Forecast']
 
 # Format date for display
 df_fc['Date']=df_fc['Week_Start'].dt.strftime('%d-%m-%Y')
