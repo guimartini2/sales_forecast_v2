@@ -163,12 +163,15 @@ else:
 # Round and rename
 df_fc[forecast_label] = df_fc['yhat'].round(0).astype(int)
 
-# Compute safety stock using coefficient of variation
-sigma = df_hist['y'].std()
-mean_d = df_hist['y'].mean()
-cv = sigma/mean_d if mean_d>0 else 0
-# apply to forecast
-df_fc['Safety_Stock'] = (df_fc[forecast_label]*cv*np.sqrt(woc_target)).round(0).astype(int)
+# Compute dynamic safety stock based on rolling forecast volatility
+# Use z-score for desired service level (e.g., 1.65 for ~95%)
+z_score = 1.65
+fc_vals = df_fc[forecast_label]
+# Rolling standard deviation over WOC periods
+rolling_std = fc_vals.rolling(window=woc_target, min_periods=1).std().fillna(0)
+# Safety stock for each week
+# Safety = z * sigma_forecast * sqrt(lead_time)
+df_fc['Safety_Stock'] = (z_score * rolling_std * np.sqrt(woc_target)).round(0).astype(int)
 
 # Replenishment logic based on manual init_inv
 on_hand_list = []
