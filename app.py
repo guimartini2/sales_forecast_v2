@@ -167,11 +167,17 @@ df_fc[forecast_label] = df_fc['yhat'].round(0).astype(int)
 # Use z-score for desired service level (e.g., 1.65 for ~95%)
 z_score = 1.65
 fc_vals = df_fc[forecast_label]
-# Rolling standard deviation over WOC periods
-rolling_std = fc_vals.rolling(window=woc_target, min_periods=1).std().fillna(0)
-# Safety stock for each week
-# Safety = z * sigma_forecast * sqrt(lead_time)
-df_fc['Safety_Stock'] = (z_score * rolling_std * np.sqrt(woc_target)).round(0).astype(int)
+# Rolling std over WOC periods
+tmp_std = fc_vals.rolling(window=woc_target, min_periods=1).std().fillna(0)
+# Minimum safety buffer as a fraction of forecast (e.g., 20%)
+tmp_min = (fc_vals * 0.2).round(0)
+# Safety stock = max(z * sigma * sqrt(lead_time), min buffer)
+df_fc['Safety_Stock'] = (
+    np.maximum(
+        z_score * tmp_std * np.sqrt(woc_target),
+        tmp_min
+    )
+).round(0).astype(int)
 
 # Replenishment logic based on manual init_inv
 on_hand_list = []
@@ -188,8 +194,10 @@ for _, row in df_fc.iterrows():
 
 df_fc['On_Hand_Begin'] = on_hand_list
 df_fc['Replenishment'] = replenishment
-# maintain constant cover
-df_fc['Weeks_Of_Cover'] = woc_target
+# Calculate dynamic Weeks of Cover based on on-hand and sell-out forecast
+df_fc['Weeks_Of_Cover'] = (
+    df_fc['On_Hand_Begin'] / df_fc['Sell-Out Units']
+).replace([np.inf, -np.inf], np.nan).round(2)
 
 # Merge upstream sell-out
 if upstream_path:
