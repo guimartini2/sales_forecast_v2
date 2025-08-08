@@ -249,10 +249,13 @@ else:
     st.line_chart(basic_df)
 
 # Table
-cols=['Date','Sell-Out Units','Safety_Stock','Replenishment','On_Hand_Begin','Weeks_Of_Cover']
+# Build table columns dynamically
+base_cols = ['Date','Sell-Out Units','Safety_Stock','Replenishment','On_Hand_Begin','Weeks_Of_Cover']
 if 'Amazon_Sellout_Forecast' in df_fc.columns:
-    cols.insert(2,'Amazon_Sellout_Forecast')
-st.dataframe(df_fc[cols])
+    base_cols.insert(2,'Amazon_Sellout_Forecast')
+# Filter for columns that exist
+display_cols = [c for c in base_cols if c in df_fc.columns]
+st.dataframe(df_fc[display_cols])
 
 # Footer
 st.markdown(f"<div style='text-align:center; color:gray; margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",unsafe_allow_html=True)
