@@ -150,16 +150,10 @@ else:
         y_col = unit_cols[0]
         forecast_label = 'Sell-Out Units'
         y_label = 'Units'
-# Clean and cast projection metric to numeric
-df_sales['y'] = (
-    df_sales[y_col].astype(str)
-        .str.replace('[^0-9.]', '', regex=True)
-        .replace('', '0')
-        .astype(float)
-)
-# Prepare final sales DataFrame
-hist = df_sales[['Week_Start','y']]
-df_sales['y'] = df_sales[y_col].astype(str).str.replace('[^0-9.]','', regex=True).astype(float)
+# Clean and cast projection metric to numeric with coercion
+numeric_series = df_sales[y_col].astype(str).str.replace('[^0-9.]', '', regex=True)
+# Convert to numeric, set invalid parsing as zero
+df_sales['y'] = pd.to_numeric(numeric_series, errors='coerce').fillna(0)
 # Prepare final sales DataFrame
 hist = df_sales[['Week_Start','y']]
 
