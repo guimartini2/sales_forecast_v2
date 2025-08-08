@@ -223,25 +223,45 @@ if upstream_path:
 # Format date for display
 result['Formatted_Week_Start'] = result['Week_Start'].dt.strftime('%d-%m-%Y')
 
-# Display chart
+# Display chart including historical performance
 st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
-metrics = [forecast_label, 'Sell_In_Forecast']
-if 'Amazon_Sellout_Forecast' in result.columns:
-    metrics.insert(1, 'Amazon_Sellout_Forecast')
+
+# Prepare historical series
+hist_series = hist[['Week_Start','y']].copy()
+hist_series = hist_series.rename(columns={'y': f'Historical_{forecast_label}'})
+
+# Merge history with result
+chart_df = pd.merge(
+    pd.DataFrame({'Week_Start': future_dates}),
+    result[['Week_Start', forecast_label, 'Sell_In_Forecast'] + (['Amazon_Sellout_Forecast'] if 'Amazon_Sellout_Forecast' in result.columns else [])],
+    on='Week_Start', how='right'
+)
+chart_df = pd.merge(chart_df, hist_series, on='Week_Start', how='outer')
+chart_df = chart_df.sort_values('Week_Start')
+
+# Define metrics order: history, upstream, forecast, sell-in
+metrics = [f'Historical_{forecast_label}']
+if 'Amazon_Sellout_Forecast' in chart_df.columns:
+    metrics.append('Amazon_Sellout_Forecast')
+metrics += [forecast_label, 'Sell_In_Forecast']
+
 if PLOTLY_INSTALLED:
-    fig = px.line(result, x='Week_Start', y=metrics,
-                  labels={'value': y_label, 'variable':'Metric'},
-                  title="Sell-In vs Demand")
+    fig = px.line(
+        chart_df, x='Week_Start', y=metrics,
+        labels={'value': y_label, 'variable':'Metric'},
+        title="Historical vs Forecast vs Sell-In"
+    )
     fig.update_layout(legend_title_text='')
     fig.update_xaxes(tickformat="%d-%m-%Y")
-    fig.update_traces(selector=dict(name=forecast_label), line=dict(color=AMZ_ORANGE, dash='dash'))
-    fig.update_traces(selector=dict(name='Sell_In_Forecast'), line=dict(color=AMZ_ORANGE))
-    if 'Amazon_Sellout_Forecast' in result.columns:
-        fig.update_traces(selector=dict(name='Amazon_Sellout_Forecast'), line=dict(color=AMZ_BLUE))
+    # style lines
+    fig.update_traces(selector=dict(name=f'Historical_{forecast_label}'), line=dict(color=AMZ_BLUE, dash='solid'))
+    if 'Amazon_Sellout_Forecast' in chart_df.columns:
+        fig.update_traces(selector=dict(name='Amazon_Sellout_Forecast'), line=dict(color=AMZ_BLUE, dash='dash'))
+    fig.update_traces(selector=dict(name=forecast_label), line=dict(color=AMZ_ORANGE, dash='dot'))
+    fig.update_traces(selector=dict(name='Sell_In_Forecast'), line=dict(color=AMZ_ORANGE, dash='solid'))
     st.plotly_chart(fig, use_container_width=True)
 else:
-    basic_df = result.set_index('Week_Start')[metrics]
-    st.line_chart(basic_df)
+    st.line_chart(chart_df.set_index('Week_Start')[metrics])
 
 # Display table
 base_cols = ['Formatted_Week_Start', forecast_label, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
