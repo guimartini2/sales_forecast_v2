@@ -100,6 +100,13 @@ if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to generate the replenishment plan.")
     st.stop()
 
+# Display product details after forecast trigger
+if sku_input or product_name:
+    st.markdown(
+        f"**Product Name:** {product_name if product_name else 'N/A'}  
+        **SKU:** {sku_input if sku_input else 'N/A'}"
+    )
+
 # Default file paths
 default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
 default_upstream = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
