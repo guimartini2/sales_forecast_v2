@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+# pick at least one forecasting engine (or include all three)
+prophet       # or fbprophet
+statsmodels
+xgboost
