@@ -123,21 +123,42 @@ raw_sales['Week_Start'] = pd.to_datetime(
 )
 # Drop rows without valid dates
 df_sales = raw_sales.dropna(subset=['Week_Start']).copy()
-# Select metric column based on projection type
+# Select metric column based on projection type (dynamic)
+cols = raw_sales.columns.tolist()
 if projection_type == 'Units':
-    y_col = 'Ordered Units'
+    # find first column name containing 'unit' (case-insensitive)
+    unit_cols = [c for c in cols if re.search(r'unit', c, re.IGNORECASE)]
+    if not unit_cols:
+        st.error("No 'Units' column found in sales data.")
+        st.stop()
+    y_col = unit_cols[0]
     forecast_label = 'Sell-Out Units'
     y_label = 'Units'
 else:
-    if 'Ordered Sales' in df_sales.columns:
-        y_col = 'Ordered Sales'
+    # find 'sales' column
+    sales_cols = [c for c in cols if re.search(r'sales', c, re.IGNORECASE)]
+    if sales_cols:
+        y_col = sales_cols[0]
         forecast_label = 'Sell-Out Sales'
         y_label = 'Sales $'
     else:
-        y_col = 'Ordered Units'
+        # fallback to units
+        unit_cols = [c for c in cols if re.search(r'unit', c, re.IGNORECASE)]
+        if not unit_cols:
+            st.error("No 'Sales' or 'Units' column found in sales data.")
+            st.stop()
+        y_col = unit_cols[0]
         forecast_label = 'Sell-Out Units'
         y_label = 'Units'
 # Clean and cast projection metric to numeric
+df_sales['y'] = (
+    df_sales[y_col].astype(str)
+        .str.replace('[^0-9.]', '', regex=True)
+        .replace('', '0')
+        .astype(float)
+)
+# Prepare final sales DataFrame
+hist = df_sales[['Week_Start','y']]
 df_sales['y'] = df_sales[y_col].astype(str).str.replace('[^0-9.]','', regex=True).astype(float)
 # Prepare final sales DataFrame
 hist = df_sales[['Week_Start','y']]
