@@ -189,6 +189,8 @@ else:
     fcst_df = pd.DataFrame({'Week_Start': future_dates, 'yhat': last_val})
 # Rename forecast column to Sell-Out label
 fcst_df = fcst_df.rename(columns={'yhat': forecast_label})
+# Round the model Sell-Out Forecast to integer units
+fcst_df[forecast_label] = fcst_df[forecast_label].round(0).astype(int)
 
 # Load initial inventory
 df_inv = pd.read_csv(inv_path, skiprows=1)
