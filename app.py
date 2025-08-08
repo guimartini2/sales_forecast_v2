@@ -68,11 +68,14 @@ if not model_options:
 
 model_choice = st.sidebar.selectbox("Select forecast model", model_options)
 woc_target = st.sidebar.slider("Target Weeks of Cover", 1.0, 12.0, 4.0, step=0.5)
-events_df = st.sidebar.experimental_data_editor(
-    pd.DataFrame(columns=["date", "uplift_pct"]), key="events"
+# Collect event impacts as CSV text: date,uplift_pct per line
+events_text = st.sidebar.text_area(
+    "Event uplifts (one per line, format: YYYY-MM-DD,Uplift% like 2025-11-25,20)",
+    height=100,
+    key="events_text"
 )
 
-if st.sidebar.button("Run Forecast"):
+if st.sidebar.button("Run Forecast"):("Run Forecast"):
     # Validate library availability
     if model_choice == "Prophet" and not PROPHET_INSTALLED:
         st.error("Prophet library not found. Install with: pip install prophet (or fbprophet).")
@@ -103,17 +106,21 @@ if st.sidebar.button("Run Forecast"):
     hist_sku = hist.query("sku == @sku")[['date','units_sold']].rename(columns={'date':'ds','units_sold':'y'})
     inv_sku  = inv.query("sku == @sku")[['date','on_hand']]
 
-    # Prepare event uplift list
-    events = []
-    for _, row in events_df.iterrows():
-        try:
-            ds = pd.to_datetime(row['date'])
-            uplift = float(row['uplift_pct']) / 100.0
-            events.append({'ds': ds, 'uplift': uplift})
-        except Exception:
-            continue
+    # Prepare event uplift list from text input
+events = []
+for line in events_text.splitlines():
+    parts = line.split(",")
+    if len(parts) != 2:
+        continue
+    date_str, uplift_str = parts[0].strip(), parts[1].strip()
+    try:
+        ds = pd.to_datetime(date_str)
+        uplift = float(uplift_str) / 100.0
+        events.append({'ds': ds, 'uplift': uplift})
+    except Exception:
+        continue
 
-    periods = 12  # forecast horizon (weeks)
+periods = 12  # forecast horizon (weeks)  # forecast horizon (weeks)
 
     # Forecast logic
     if model_choice == "Prophet":
