@@ -181,28 +181,29 @@ raw_str = str(oh_raw)
 digits = re.sub(r'[^0-9]', '', raw_str)
 init_inv = int(digits) if digits else 0
 
-# Compute dynamic safety stock using CV using CV using CV
+# Compute dynamic safety stock using coefficient of variation
 sigma = df_hist['y'].std()
 mean_d = df_hist['y'].mean()
 cv = sigma / mean_d if mean_d > 0 else 0
-# Safety scales with forecast level
-safety = (df_fc[forecast_label] * cv * np.sqrt(woc_target)).round(0).astype(int)
+# Safety stock scales with forecast level
+df_fc['Safety_Stock'] = (df_fc['Sell-Out Units'] * cv * np.sqrt(woc_target)).round(0).astype(int)
 
-# Replenishment logic
-records = []
+# Vectorized replenishment and on-hand computation
+replenishment = []
+on_hand_begin = []
 prev_on = init_inv
-for idx, row in df_fc.iterrows():
-    D = row[forecast_label]
-    S = safety.iloc[idx]
-    # Inventory target = D * WOC
+for D, S in zip(df_fc['Sell-Out Units'], df_fc['Safety_Stock']):
     inv_target = D * woc_target
-    # Replenishment = inv_target + S - prev_on
     Q = max(inv_target + S - prev_on, 0)
-    records.append((prev_on, S, int(Q), woc_target))
+    replenishment.append(int(Q))
+    on_hand_begin.append(int(prev_on))
     prev_on = prev_on + Q - D
 
-# Build result DataFrame
-df_fc['On_Hand_Begin'], df_fc['Safety_Stock'], df_fc['Replenishment'], df_fc['Weeks_Of_Cover'] = zip(*records)
+df_fc['Replenishment'] = replenishment
+ndx = on_hand_begin
+ df_fc['On_Hand_Begin'] = ndx
+# Weeks of Cover constant by design
+df_fc['Weeks_Of_Cover'] = woc_target
 
 # Merge Amazon upstream sell-out forecast
 if upstream_path:
