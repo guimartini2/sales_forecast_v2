@@ -112,30 +112,35 @@ if not sales_path or not inv_path:
     st.stop()
 
 # Load sales data
-df_sales = pd.read_csv(sales_path, skiprows=1)
-# Parse week start date
-df_sales['Week_Start'] = pd.to_datetime(
-    df_sales['Week'].str.split(' - ').str[0].str.strip()
+# Skip metadata row and read raw data
+raw_sales = pd.read_csv(sales_path, skiprows=1)
+# Dynamically find the week column (first column)
+week_col = raw_sales.columns[0]
+# Parse week start date from the first part of the week range
+raw_sales['Week_Start'] = pd.to_datetime(
+    raw_sales[week_col].astype(str).str.split(' - ').str[0].str.strip(),
+    errors='coerce'
 )
-# Select metric
+# Drop rows without valid dates
+df_sales = raw_sales.dropna(subset=['Week_Start']).copy()
+# Select metric column based on projection type
 if projection_type == 'Units':
-    df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
-    # Rename forecast metric to Sell-Out Units
+    y_col = 'Ordered Units'
     forecast_label = 'Sell-Out Units'
     y_label = 'Units'
 else:
     if 'Ordered Sales' in df_sales.columns:
-        df_sales['y'] = df_sales['Ordered Sales']\
-            .str.replace('[^0-9.]','', regex=True)\
-            .astype(float)
+        y_col = 'Ordered Sales'
         forecast_label = 'Sell-Out Sales'
         y_label = 'Sales $'
     else:
-        df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
+        y_col = 'Ordered Units'
         forecast_label = 'Sell-Out Units'
         y_label = 'Units'
-# Filter data
-df_sales = df_sales[['Week_Start','y']]
+# Clean and cast projection metric to numeric
+df_sales['y'] = df_sales[y_col].astype(str).str.replace('[^0-9.]','', regex=True).astype(float)
+# Prepare final sales DataFrame
+hist = df_sales[['Week_Start','y']]
 
 # Historical data cutoff
 today = pd.to_datetime(datetime.now().date())
