@@ -113,16 +113,20 @@ if projection_type == "Units":
     df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
     y_label = "Units"
 else:
-    st.warning("Plotly not installed; showing basic chart.")
-    # Basic chart using Inventory and Forecast columns
-    forecast_col = f'Forecasted_{y_label}'
-    if forecast_col in result.columns:
-        basic_df = result.set_index('Week_Start')[[forecast_col, 'Inventory_On_Hand']]
+    # Attempt to parse sales dollars
+    if 'Ordered Sales' in df_sales.columns:
+        df_sales['y'] = df_sales['Ordered Sales']\
+            .str.replace('[^0-9.]','', regex=True)\
+            .astype(float)
+        y_label = "Sales $"
     else:
-        basic_df = result.set_index('Week_Start')[['Inventory_On_Hand']]
-    st.line_chart(basic_df)
+        st.sidebar.warning("'Ordered Sales' column not found; defaulting to Units.")
+        df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
+        y_label = "Units"
 
+# Continue with filtering history, forecasting, and merging
 # Table
+
 display_cols = ['Week_Start', f'Forecasted_{y_label}', 'Sell_In_Units', 'Inventory_On_Hand', 'Weeks_Of_Cover']
 if 'Upstream_Forecast' in result: display_cols.insert(3,'Upstream_Forecast')
 st.dataframe(result[display_cols].round(2))
