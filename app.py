@@ -180,6 +180,8 @@ on_hand_series = pd.to_numeric(
     df_inv[inv_cols[0]].astype(str).str.replace('[^0-9]', '', regex=True), errors='coerce'
 ).fillna(0).astype(int)
 init_inv = on_hand_series.sum()
+# Debug: display initial inventory loaded for verification
+st.write("Initial inventory loaded:", init_inv)
 
 # Compute dynamic safety stock using coefficient of variation using coefficient of variation
 sigma = df_hist['y'].std()
