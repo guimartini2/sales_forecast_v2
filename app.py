@@ -1,5 +1,5 @@
 """
-Amazon Replenishment Forecast Streamlit App (Amazon Branded)1
+Amazon Replenishment Forecast Streamlit App (Amazon Branded)
 
 Dependencies (add to requirements.txt):
 
@@ -122,12 +122,14 @@ df_raw.dropna(subset=['Week_Start'], inplace=True)
 sku, product = 'N/A', 'N/A'
 if upstream_path:
     try:
-        df_up_hd = pd.read_csv(upstream_path, nrows=1)
+        # Read header and first data row (skip metadata row)
+        df_up_hd = pd.read_csv(upstream_path, skiprows=1, nrows=1)
+        # Find SKU/ASIN column and product name column
         sku_col = next((c for c in df_up_hd.columns if re.search(r'ASIN|SKU', c, re.IGNORECASE)), None)
         name_col = next((c for c in df_up_hd.columns if re.search(r'Name|Title|Product', c, re.IGNORECASE)), None)
-        if sku_col:
+        if sku_col and sku_col in df_up_hd.columns:
             sku = df_up_hd[sku_col].iloc[0]
-        if name_col:
+        if name_col and name_col in df_up_hd.columns:
             product = df_up_hd[name_col].iloc[0]
     except Exception:
         pass
