@@ -176,13 +176,12 @@ if not inv_cols:
     st.error("No inventory 'On Hand' column found.")
     st.stop()
 oh_raw = df_inv[inv_cols[0]].iloc[0]
-# Parse initial inventory, stripping commas
-try:
-    init_inv = int(str(oh_raw).replace(",", ""))
-except:
-    init_inv = int(oh_raw)
+# Robust parse initial inventory: strip non-digits and convert
+raw_str = str(oh_raw)
+digits = re.sub(r'[^0-9]', '', raw_str)
+init_inv = int(digits) if digits else 0
 
-# Compute dynamic safety stock using CV using CV
+# Compute dynamic safety stock using CV using CV using CV
 sigma = df_hist['y'].std()
 mean_d = df_hist['y'].mean()
 cv = sigma / mean_d if mean_d > 0 else 0
