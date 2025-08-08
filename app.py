@@ -201,8 +201,10 @@ for D, S in zip(df_fc['Sell-Out Units'], df_fc['Safety_Stock']):
 
 df_fc['Replenishment'] = replenishment
 ndx = on_hand_begin
- df_fc['On_Hand_Begin'] = ndx
+# Assign computed on-hand at the start of each week
+df_fc['On_Hand_Begin'] = ndx
 # Weeks of Cover constant by design
+df_fc['Weeks_Of_Cover'] = woc_target
 df_fc['Weeks_Of_Cover'] = woc_target
 
 # Merge Amazon upstream sell-out forecast
