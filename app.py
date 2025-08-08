@@ -113,77 +113,13 @@ if projection_type == "Units":
     df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
     y_label = "Units"
 else:
-    if 'Ordered Sales' in df_sales:
-        df_sales['y'] = df_sales['Ordered Sales'].str.replace('[^0-9.]','',regex=True).astype(float)
-        y_label = "Sales $"
-    else:
-        st.sidebar.warning("'Ordered Sales' not found; defaulting to Units.")
-        df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
-        y_label = "Units"
-
-# Filter history to today
-today = pd.to_datetime(datetime.now().date())
-hist = df_sales[df_sales['Week_Start'] <= today][['Week_Start','y']]
-if hist.empty:
-    st.error("No historical data before today.")
-    st.stop()
-last_date = hist['Week_Start'].max()
-start_date = max(last_date + timedelta(weeks=1), today + timedelta(weeks=1))
-future_idx = pd.date_range(start=start_date, periods=periods, freq='W')
-
-# Forecast
-if model_choice == 'Prophet':
-    m = Prophet(weekly_seasonality=True)
-    m.fit(hist.rename(columns={'Week_Start':'ds'}))
-    future = pd.DataFrame({'ds': future_idx})
-    forecast = m.predict(future)[['ds','yhat']].rename(columns={'ds':'Week_Start'})
-elif model_choice == 'ARIMA':
-    hw = hist.set_index('Week_Start').resample('W-SUN').sum().reset_index()
-    ar = ARIMA(hw['y'],order=(1,1,1)).fit()
-    f = ar.get_forecast(steps=periods)
-    forecast = pd.DataFrame({'Week_Start':future_idx, 'yhat':f.predicted_mean.values})
-else:
-    last = hist['y'].iloc[-1]
-    forecast = pd.DataFrame({'Week_Start':future_idx, 'yhat':last})
-
-# Inventory
-df_inv = pd.read_csv(inv_path, skiprows=1)
-oh = int(str(df_inv['Sellable On Hand Units'].iloc[0]).replace(',',''))
-inv_df = pd.DataFrame({'Week_Start':future_idx, 'Inventory_On_Hand':oh})
-
-# Combine
-result = forecast.merge(inv_df, on='Week_Start')
-result['Weeks_Of_Cover'] = result['Inventory_On_Hand'] / result['yhat']
-result['Sell_In_Units'] = result['Inventory_On_Hand'] / woc_target
-
-# Upstream
-if fcst_path:
-    df_fc = pd.read_csv(fcst_path, skiprows=1)
-    rec = []
-    for col in df_fc.columns:
-        if col.startswith('Week '):
-            m = re.search(r'Week \d+ \((\d+ \w+)',col)
-            if m:
-                ds = pd.to_datetime(m.group(1)+' 2025',format='%d %b %Y')
-                rec.append({'Week_Start':ds, 'Upstream_Forecast':float(df_fc[col].iloc[0].replace(',',''))})
-    upstream = pd.DataFrame(rec)
-    result = result.merge(upstream, on='Week_Start', how='left')
-
-# Rename forecast column
-result = result.rename(columns={'yhat':f'Forecasted_{y_label}'})
-
-# Plot
-st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
-if PLOTLY_INSTALLED:
-    metrics = [f'Forecasted_{y_label}','Inventory_On_Hand','Sell_In_Units'] + (['Upstream_Forecast'] if 'Upstream_Forecast' in result else [])
-    fig = px.line(result, x='Week_Start', y=metrics, labels={'value':y_label,'variable':'Metric'})
-    fig.update_traces(selector=dict(name=f'Forecasted_{y_label}'), line=dict(color=AMAZON_PRIMARY,dash='dash'))
-    fig.update_traces(selector=dict(name='Inventory_On_Hand'), line=dict(color=AMAZON_SECONDARY))
-    fig.update_traces(selector=dict(name='Sell_In_Units'), line=dict(color=AMAZON_PRIMARY))
-    st.plotly_chart(fig, use_container_width=True)
-else:
     st.warning("Plotly not installed; showing basic chart.")
-    basic_df = result.set_index('Week_Start')[['Inventory_On_Hand', 'yhat']]
+    # Basic chart using Inventory and Forecast columns
+    forecast_col = f'Forecasted_{y_label}'
+    if forecast_col in result.columns:
+        basic_df = result.set_index('Week_Start')[[forecast_col, 'Inventory_On_Hand']]
+    else:
+        basic_df = result.set_index('Week_Start')[['Inventory_On_Hand']]
     st.line_chart(basic_df)
 
 # Table
