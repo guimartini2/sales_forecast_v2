@@ -97,6 +97,12 @@ periods = st.sidebar.number_input("Forecast Horizon (weeks)", min_value=4, max_v
 
 st.markdown("---")
 
+# Run forecast trigger
+run_button = st.button("Run Forecast")
+if not run_button:
+    st.info("Click 'Run Forecast' to run the sell-in forecast")
+    st.stop()
+
 # Default file paths
 DEFAULT_SALES     = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
 DEFAULT_INVENTORY = "/mnt/data/Inventory_ASIN_Manufacturing_Retail_UnitedStates_Custom_8-6-2025_8-6-2025.csv"
