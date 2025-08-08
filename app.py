@@ -1,3 +1,17 @@
+"""
+Amazon Sell-In Forecast Streamlit App
+
+Dependencies (add to requirements.txt):
+
+streamlit>=1.0
+pandas>=1.3
+numpy>=1.21
+# At least one forecasting engine
+prophet>=1.0    # or fbprophet>=0.7
+statsmodels>=0.13
+xgboost>=1.7
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
