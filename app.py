@@ -159,6 +159,37 @@ df_fc[forecast_label]=df_fc['yhat'].round(0).astype(int)
 # Override with Amazon sell-out forecast where available
 if up_path:
     try:
+        df_up_raw = pd.read_csv(up_path)
+    except pd.errors.EmptyDataError:
+        st.warning('⚠️ Amazon sell-out forecast file is empty; skipping upstream merge.')
+        df_up_raw = pd.DataFrame()
+    except Exception:
+        df_up_raw = pd.DataFrame()
+    if not df_up_raw.empty:
+        row0 = df_up_raw.iloc[0]
+        rec = []
+        for col in df_up_raw.columns:
+            if '(' in col and ')' in col:
+                m = re.search(r"\((\d{1,2} [A-Za-z]+)\)", col)
+                if m:
+                    dt = pd.to_datetime(
+                        f"{m.group(1)} {datetime.now().year}",
+                        format="%d %b %Y", errors='coerce'
+                    )
+                    val = pd.to_numeric(str(row0[col]).replace(',', ''), errors='coerce')
+                    if pd.notna(val):
+                        rec.append({'Week_Start': dt.normalize(), 'Amazon_Sellout_Forecast': int(round(val))})
+        if rec:
+            df_up = pd.DataFrame(rec).dropna(subset=['Week_Start']).sort_values('Week_Start')
+            df_up['Week_Start'] = pd.to_datetime(df_up['Week_Start']).dt.normalize()
+            df_fc['Week_Start'] = pd.to_datetime(df_fc['Week_Start']).dt.normalize()
+            df_fc = df_fc.merge(df_up, on='Week_Start', how='left')
+            df_fc[forecast_label] = df_fc['Amazon_Sellout_Forecast'].fillna(df_fc[forecast_label]).astype(int)
+
+
+# Override with Amazon sell-out forecast where available
+if up_path:
+    try:
         df_up_raw = pd.read_csv(up_path, skiprows=1)
     except pd.errors.EmptyDataError:
         st.warning("⚠️ Amazon sell-out forecast file is empty; skipping upstream merge.")
