@@ -169,7 +169,11 @@ else:
 df_fc[forecast_label] = df_fc['yhat'].round(0).astype(int)
 
 # Load inventory snapshot dynamically
-df_inv = pd.read_csv(inv_path, skiprows=1)
+# Read full file to preserve header row
+try:
+    df_inv = pd.read_csv(inv_path)
+except Exception:
+    df_inv = pd.read_csv(inv_path, skiprows=1)
 # Dynamic detection of on-hand column
 inv_cols = [c for c in df_inv.columns if re.search(r'on hand|sellable', c, re.IGNORECASE)]
 if not inv_cols:
@@ -179,9 +183,11 @@ if not inv_cols:
 on_hand_series = pd.to_numeric(
     df_inv[inv_cols[0]].astype(str).str.replace('[^0-9]', '', regex=True), errors='coerce'
 ).fillna(0).astype(int)
-# Use the first snapshot as starting inventory (not sum)
+# Use the first snapshot as starting inventory
 init_inv = int(on_hand_series.iloc[0])
 # Debug: display initial inventory loaded for verification
+st.write("Initial inventory loaded:", init_inv)
+
 st.write("Initial inventory loaded:", init_inv)
 st.write("Initial inventory loaded:", init_inv)
 
