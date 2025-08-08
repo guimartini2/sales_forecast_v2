@@ -103,15 +103,13 @@ if not st.button("Run Forecast"):
 
 # Default file paths
 default_sales     = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
-default_inventory = "/mnt/data/Inventory_ASIN_Manufacturing_Retail_UnitedStates_Custom_8-6-2025_8-6-2025.csv"
 default_upstream  = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 
 sales_path   = sales_file if sales_file else (default_sales if os.path.exists(default_sales) else None)
-inv_path     = inv_file   if inv_file   else (default_inventory if os.path.exists(default_inventory) else None)
 upstream_path= fcst_file  if fcst_file  else (default_upstream if os.path.exists(default_upstream) else None)
 
-if not sales_path or not inv_path:
-    st.error("Sales history and inventory snapshot files are required.")
+if not sales_path:
+    st.error("Sales history file is required.")
     st.stop()
 
 # Load sales data
