@@ -69,6 +69,10 @@ st.markdown(
 
 # Sidebar inputs
 st.sidebar.header("Data Inputs & Settings")
+# Product details inputs
+sku_input = st.sidebar.text_input("SKU", value="", help="Enter the ASIN or product SKU.")
+product_name = st.sidebar.text_input("Product Name", value="", help="Enter the product name.")
+
 sales_file = st.sidebar.file_uploader("Sales history CSV", type=["csv"])
 fcst_file = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV", type=["csv"])
 projection_type = st.sidebar.selectbox("Projection Type", ["Units", "Sales $"])
@@ -221,15 +225,29 @@ df_fc['Date'] = df_fc['Week_Start'].dt.strftime('%d-%m-%Y')
 
 # Plot
 st.subheader(f"{periods}-Week Replenishment Plan ({projection_type})")
-metrics=[key for key in ['Sell-Out Units','Safety_Stock','Replenishment','Amazon_Sellout_Forecast'] if key in df_fc]
+# Only show Safety Stock, Replenishment, and Amazon forecast if available
+metrics = ['Safety_Stock', 'Replenishment']
+if 'Amazon_Sellout_Forecast' in df_fc.columns:
+    metrics.insert(0, 'Amazon_Sellout_Forecast')
+
 if PLOTLY_INSTALLED:
-    fig=px.line(df_fc,x='Week_Start',y=metrics,labels={'value':y_label,'variable':'Metric'},title='Replenishment vs Demand')
+    fig = px.line(
+        df_fc, x='Week_Start', y=metrics,
+        labels={'value': y_label, 'variable': 'Metric'},
+        title='Replenishment vs Demand'
+    )
     fig.update_xaxes(tickformat='%d-%m-%Y')
-    st.plotly_chart(fig,use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 else:
     st.line_chart(df_fc.set_index('Week_Start')[metrics])
 
 # Table and footer
+# Build table columns without Sell-Out Units
+table_cols = ['Date'] + metrics + ['On_Hand_Begin', 'Weeks_Of_Cover']
+display_cols = [c for c in table_cols if c in df_fc.columns]
+st.dataframe(df_fc[display_cols])
+
+st.markdown(f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",unsafe_allow_html=True)
 display_cols=[c for c in ['Date']+metrics+['On_Hand_Begin','Weeks_Of_Cover'] if c in df_fc]
 st.dataframe(df_fc[display_cols])
 st.markdown(f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",unsafe_allow_html=True)
