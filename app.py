@@ -119,7 +119,18 @@ name_col = next((c for c in df_raw.columns if re.search(r'Name|Title|Product', c
 sku = df_raw[sku_col].iloc[0] if sku_col else 'N/A'
 product = df_raw[name_col].iloc[0] if name_col else 'N/A'
 
-# Display product details after forecast trigger
+# AUTO-DETECT PRODUCT INFO FROM Amazon Sell-Out Forecast FILE
+def sku, product = 'N/A', 'N/A'
+if upstream_path:
+    try:
+        df_up_head = pd.read_csv(upstream_path, nrows=1)
+        sku_col = next((c for c in df_up_head.columns if re.search(r'ASIN|SKU', c, re.IGNORECASE)), None)
+        name_col = next((c for c in df_up_head.columns if re.search(r'Name|Title|Product', c, re.IGNORECASE)), None)
+        sku = df_up_head[sku_col].iloc[0] if sku_col and sku_col in df_up_head.columns else 'N/A'
+        product = df_up_head[name_col].iloc[0] if name_col and name_col in df_up_head.columns else 'N/A'
+    except Exception:
+        pass
+# DISPLAY PRODUCT AND SKU
 st.markdown(
     f"**Product:** {product}  <br>**SKU:** {sku}",
     unsafe_allow_html=True
@@ -173,30 +184,14 @@ else:
 # Round and rename
 df_fc[forecast_label] = df_fc['yhat'].round(0).astype(int)
 
-# Compute dynamic safety stock based on rolling forecast volatility
-# Use z-score for desired service level (e.g., 1.65 for ~95%)
-z_score = 1.65
-fc_vals = df_fc[forecast_label]
-# Rolling std over WOC periods
-tmp_std = fc_vals.rolling(window=woc_target, min_periods=1).std().fillna(0)
-# Minimum safety buffer as a fraction of forecast (e.g., 20%)
-tmp_min = (fc_vals * 0.2).round(0)
-# Safety stock = max(z * sigma * sqrt(lead_time), min buffer)
-df_fc['Safety_Stock'] = (
-    np.maximum(
-        z_score * tmp_std * np.sqrt(woc_target),
-        tmp_min
-    )
-).round(0).astype(int)
-
 # Replenishment logic based on manual init_inv
 on_hand_list = []
 replenishment = []
 prev_on = init_inv
 for _, row in df_fc.iterrows():
     D = row[forecast_label]
-    S = row['Safety_Stock']
-    target_inv = D*woc_target + S
+    # Inventory target = demand * WOC
+target_inv = D * woc_target
     Q = max(target_inv - prev_on, 0)
     on_hand_list.append(int(prev_on))
     replenishment.append(int(Q))
@@ -206,7 +201,7 @@ df_fc['On_Hand_Begin'] = on_hand_list
 df_fc['Replenishment'] = replenishment
 # Calculate dynamic Weeks of Cover based on on-hand and sell-out forecast
 df_fc['Weeks_Of_Cover'] = (
-    df_fc['On_Hand_Begin'] / df_fc['Sell-Out Units']
+    df_fc['On_Hand_Begin'] / df_fc[forecast_label]
 ).replace([np.inf, -np.inf], np.nan).round(2)
 
 # Merge upstream sell-out
@@ -223,16 +218,12 @@ if upstream_path:
     if rec:
         df_fc=df_fc.merge(pd.DataFrame(rec),on='Week_Start',how='left')
 
-# unify sell-out metric
-df_fc['Sell-Out Units'] = df_fc.get('Amazon_Sellout_Forecast', df_fc[forecast_label])
-
 # Format date
 df_fc['Date'] = df_fc['Week_Start'].dt.strftime('%d-%m-%Y')
 
 # Plot
 st.subheader(f"{periods}-Week Replenishment Plan ({projection_type})")
-# Only show Safety Stock, Replenishment, and Amazon forecast if available
-metrics = ['Safety_Stock', 'Replenishment']
+metrics = ['Replenishment']
 if 'Amazon_Sellout_Forecast' in df_fc.columns:
     metrics.insert(0, 'Amazon_Sellout_Forecast')
 
@@ -248,7 +239,7 @@ else:
     st.line_chart(df_fc.set_index('Week_Start')[metrics])
 
 # Table and footer
-# Build table columns without Sell-Out Units
+# Build table columns without Safety Stock
 table_cols = ['Date'] + metrics + ['On_Hand_Begin', 'Weeks_Of_Cover']
 display_cols = [c for c in table_cols if c in df_fc.columns]
 st.dataframe(df_fc[display_cols])
