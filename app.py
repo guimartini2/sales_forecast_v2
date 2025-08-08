@@ -1,4 +1,3 @@
-```python
 """
 Amazon Replenishment Forecast Streamlit App (Amazon Branded)
 
@@ -97,7 +96,7 @@ periods = st.sidebar.number_input(
 )
 
 st.markdown("---")
-# Trigger
+# Run forecast trigger
 if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to run the replenishment plan.")
     st.stop()
@@ -115,27 +114,26 @@ if not sales_path:
 df_raw = pd.read_csv(sales_path, skiprows=1)
 # Parse week start date
 df_raw['Week_Start'] = pd.to_datetime(
-    df_raw.iloc[:,0].astype(str).str.split(' - ').str[0].str.strip(),
-    errors='coerce'
+    df_raw.iloc[:,0].astype(str).str.split(' - ').str[0].str.strip(), errors='coerce'
 )
 df_raw.dropna(subset=['Week_Start'], inplace=True)
 
 # Auto-detect product info from sell-out forecast file
-def sku, product = 'N/A', 'N/A'
+sku, product = 'N/A', 'N/A'
 if upstream_path:
     try:
         df_up_hd = pd.read_csv(upstream_path, nrows=1)
         sku_col = next((c for c in df_up_hd.columns if re.search(r'ASIN|SKU', c, re.IGNORECASE)), None)
         name_col = next((c for c in df_up_hd.columns if re.search(r'Name|Title|Product', c, re.IGNORECASE)), None)
-        if sku_col and sku_col in df_up_hd.columns:
+        if sku_col:
             sku = df_up_hd[sku_col].iloc[0]
-        if name_col and name_col in df_up_hd.columns:
+        if name_col:
             product = df_up_hd[name_col].iloc[0]
     except Exception:
         pass
+# Display product details
 st.markdown(
-    f"**Product:** {product}  <br>**SKU:** {sku}",
-    unsafe_allow_html=True
+    f"**Product:** {product}  <br>**SKU:** {sku}", unsafe_allow_html=True
 )
 
 # Determine metric column for historical data
@@ -155,8 +153,7 @@ else:
 df_hist = pd.DataFrame({
     'Week_Start': df_raw['Week_Start'],
     'y': pd.to_numeric(
-        df_raw[y_col].astype(str).str.replace('[^0-9.]','',regex=True),
-        errors='coerce'
+        df_raw[y_col].astype(str).str.replace('[^0-9.]', '', regex=True), errors='coerce'
     ).fillna(0)
 })
 df_hist = df_hist[df_hist['Week_Start'] <= pd.to_datetime(datetime.now().date())]
@@ -196,17 +193,15 @@ replen = []
 prev_on = init_inv
 for _, row in df_fc.iterrows():
     D = row[forecast_label]
-    # Target inventory = demand * WOC
     target = D * woc_target
     Q = max(target - prev_on, 0)
     on_hand.append(int(prev_on))
     replen.append(int(Q))
     prev_on = prev_on + Q - D
 
-# Assign fields
 df_fc['On_Hand_Begin'] = on_hand
 df_fc['Replenishment'] = replen
-# Dynamic Weeks of Cover
+# Dynamic Weeks of Cover based on on-hand and demand
 df_fc['Weeks_Of_Cover'] = (
     df_fc['On_Hand_Begin'] / df_fc[forecast_label]
 ).replace([np.inf, -np.inf], np.nan).round(2)
@@ -217,15 +212,14 @@ if upstream_path:
     rec = []
     for c in df_up.columns:
         if c.startswith('Week '):
-            m = re.search(r'\((\d{1,2} [A-Za-z]+)', c)
+            m = re.search(r"\((\d{1,2} [A-Za-z]+)", c)
             if m:
                 dt = pd.to_datetime(
                     m.group(1) + ' ' + str(datetime.now().year),
                     format='%d %b %Y', errors='coerce'
                 )
                 val = pd.to_numeric(
-                    str(df_up[c].iloc[0]).replace(',',''),
-                    errors='coerce'
+                    str(df_up[c].iloc[0]).replace(',', ''), errors='coerce'
                 )
                 rec.append({'Week_Start': dt, 'Amazon_Sellout_Forecast': int(round(val))})
     if rec:
@@ -259,4 +253,3 @@ st.markdown(
     f"<div style='text-align:center; color:gray; margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",
     unsafe_allow_html=True
 )
-```
