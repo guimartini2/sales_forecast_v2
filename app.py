@@ -76,9 +76,11 @@ st.markdown(
 # Sidebar inputs
 st.sidebar.header("Data Inputs & Settings")
 sales_file = st.sidebar.file_uploader("Sales history CSV", type=["csv"])
-inv_file   = st.sidebar.file_uploader("Inventory snapshot CSV", type=["csv"])
+#inv_file   = st.sidebar.file_uploader("Inventory snapshot CSV", type=["csv"])
 fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV", type=["csv"])
 projection_type = st.sidebar.selectbox("Projection Type", ["Units", "Sales $"])
+# Manual entry for current on-hand inventory
+init_inv = st.sidebar.number_input("Current On-Hand Inventory (units)", min_value=0, value=26730, step=1)
 
 # Model selection
 model_opts = []
@@ -169,23 +171,35 @@ else:
 df_fc[forecast_label] = df_fc['yhat'].round(0).astype(int)
 
 # Load inventory snapshot dynamically
-# Read full file to preserve header row
-try:
-    df_inv = pd.read_csv(inv_path)
-except Exception:
-    df_inv = pd.read_csv(inv_path, skiprows=1)
+df_inv = pd.read_csv(inv_path)
 # Dynamic detection of on-hand column
 inv_cols = [c for c in df_inv.columns if re.search(r'on hand|sellable', c, re.IGNORECASE)]
 if not inv_cols:
-    st.error("No inventory 'On Hand' column found.")
-    st.stop()
-# Convert the on-hand column to numeric
+    # Fallback: pick the numeric column with the highest value
+    candidate = None
+    max_val = 0
+    for c in df_inv.columns:
+        # strip non-digits and convert
+        s = pd.to_numeric(df_inv[c].astype(str)
+                           .str.replace('[^0-9]', '', regex=True), errors='coerce').fillna(0).astype(int)
+        if s.max() > max_val:
+            max_val = s.max()
+            candidate = c
+    if candidate:
+        inv_cols = [candidate]
+    else:
+        st.error("Could not detect an inventory on-hand column.")
+        st.stop()
+# Parse the on-hand series
 on_hand_series = pd.to_numeric(
-    df_inv[inv_cols[0]].astype(str).str.replace('[^0-9]', '', regex=True), errors='coerce'
+    df_inv[inv_cols[0]].astype(str).str.replace('[^0-9]', '', regex=True),
+    errors='coerce'
 ).fillna(0).astype(int)
 # Use the first snapshot as starting inventory
 init_inv = int(on_hand_series.iloc[0])
 # Debug: display initial inventory loaded for verification
+st.write("Initial inventory loaded:", init_inv)
+
 st.write("Initial inventory loaded:", init_inv)
 
 st.write("Initial inventory loaded:", init_inv)
