@@ -255,6 +255,8 @@ st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
 # Prepare historical series
 hist_series = hist[['Week_Start','y']].copy()
 hist_series = hist_series.rename(columns={'y': f'Historical_{forecast_label}'})
+# Round historical to integer units
+hist_series[f'Historical_{forecast_label}'] = hist_series[f'Historical_{forecast_label}'].round(0).astype(int)
 
 # Merge history and future results for chart
 to_merge = [forecast_label, 'Sell_In_Forecast']
