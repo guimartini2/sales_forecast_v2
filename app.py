@@ -247,6 +247,8 @@ if upstream_path:
     if rec:
         upstream_df = pd.DataFrame(rec)
         result = result.merge(upstream_df, on='Week_Start', how='left')
+# Override Sell-Out Units with Amazon’s forecast
+result[forecast_label] = result['Amazon_Sellout_Forecast']
 
 # Format date for display
 result['Formatted_Week_Start'] = result['Week_Start'].dt.strftime('%d-%m-%Y')
