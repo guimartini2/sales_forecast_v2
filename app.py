@@ -120,15 +120,19 @@ df_sales['Week_Start'] = pd.to_datetime(
 # Select metric
 if projection_type == 'Units':
     df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
+    # Rename forecast metric to Sell-Out Units
+    forecast_label = 'Sell-Out Units'
     y_label = 'Units'
 else:
     if 'Ordered Sales' in df_sales.columns:
         df_sales['y'] = df_sales['Ordered Sales']\
             .str.replace('[^0-9.]','', regex=True)\
             .astype(float)
+        forecast_label = 'Sell-Out Sales'
         y_label = 'Sales $'
     else:
         df_sales['y'] = df_sales['Ordered Units'].str.replace(',','').astype(int)
+        forecast_label = 'Sell-Out Units'
         y_label = 'Units'
 # Filter data
 df_sales = df_sales[['Week_Start','y']]
@@ -157,9 +161,8 @@ elif model_choice == 'ARIMA':
 else:
     last_val = hist['y'].iloc[-1]
     fcst_df = pd.DataFrame({'Week_Start': future_dates, 'yhat': last_val})
-# Rename forecast column
-forecast_col = f'Forecasted_{y_label}'
-fcst_df = fcst_df.rename(columns={'yhat': forecast_col})
+# Rename forecast column to Sell-Out label
+fcst_df = fcst_df.rename(columns={'yhat': forecast_label})
 
 # Load initial inventory
 df_inv = pd.read_csv(inv_path, skiprows=1)
@@ -170,13 +173,12 @@ except:
     init_inv = float(str(oh_raw).replace(',',''))
 
 # Compute dynamic inventory and sell-in to maintain constant WOC
-# Initialize lists and previous inventory
 desired_inv = init_inv
 inv_list = []
 sellin_list = []
 prev_inv = init_inv
 for _, row in fcst_df.iterrows():
-    demand = row[forecast_col]
+    demand = row[forecast_label]
     # desired ending inventory to hit WOC target
     desired_inv = demand * woc_target
     # sell-in needed this week to reach desired inventory
@@ -221,21 +223,18 @@ if upstream_path:
 # Format date for display
 result['Formatted_Week_Start'] = result['Week_Start'].dt.strftime('%d-%m-%Y')
 
-# Round forecasts
-result[forecast_col] = result[forecast_col].round(0).astype(int)
-
 # Display chart
 st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
-metrics = [forecast_col, 'Sell_In_Forecast']
+metrics = [forecast_label, 'Sell_In_Forecast']
 if 'Amazon_Sellout_Forecast' in result.columns:
     metrics.insert(1, 'Amazon_Sellout_Forecast')
 if PLOTLY_INSTALLED:
     fig = px.line(result, x='Week_Start', y=metrics,
-                  labels={'value': y_label, 'variable': 'Metric'},
+                  labels={'value': y_label, 'variable':'Metric'},
                   title="Sell-In vs Demand")
     fig.update_layout(legend_title_text='')
     fig.update_xaxes(tickformat="%d-%m-%Y")
-    fig.update_traces(selector=dict(name=forecast_col), line=dict(color=AMZ_ORANGE, dash='dash'))
+    fig.update_traces(selector=dict(name=forecast_label), line=dict(color=AMZ_ORANGE, dash='dash'))
     fig.update_traces(selector=dict(name='Sell_In_Forecast'), line=dict(color=AMZ_ORANGE))
     if 'Amazon_Sellout_Forecast' in result.columns:
         fig.update_traces(selector=dict(name='Amazon_Sellout_Forecast'), line=dict(color=AMZ_BLUE))
@@ -245,8 +244,7 @@ else:
     st.line_chart(basic_df)
 
 # Display table
-# Build display columns dynamically
-base_cols = ['Formatted_Week_Start', forecast_col, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
+base_cols = ['Formatted_Week_Start', forecast_label, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
 if 'Amazon_Sellout_Forecast' in result.columns:
     base_cols.insert(2, 'Amazon_Sellout_Forecast')
 st.dataframe(result[base_cols])
