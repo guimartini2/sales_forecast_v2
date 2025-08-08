@@ -185,27 +185,33 @@ init_inv = int(digits) if digits else 0
 sigma = df_hist['y'].std()
 mean_d = df_hist['y'].mean()
 cv = sigma / mean_d if mean_d > 0 else 0
-# Safety stock scales with forecast level
-df_fc['Safety_Stock'] = (df_fc['Sell-Out Units'] * cv * np.sqrt(woc_target)).round(0).astype(int)
+# Safety stock per period scales with forecast and covers variability
+if 'Sell-Out Units' in df_fc.columns:
+    df_fc['Safety_Stock'] = (df_fc['Sell-Out Units'] * cv * np.sqrt(woc_target)).round(0).astype(int)
+else:
+    df_fc['Safety_Stock'] = 0
 
-# Vectorized replenishment and on-hand computation
+# Replenishment logic
 replenishment = []
 on_hand_begin = []
 prev_on = init_inv
-for D, S in zip(df_fc['Sell-Out Units'], df_fc['Safety_Stock']):
-    inv_target = D * woc_target
-    Q = max(inv_target + S - prev_on, 0)
-    replenishment.append(int(Q))
+for idx, row in df_fc.iterrows():
+    D = row['Sell-Out Units']
+    S = row['Safety_Stock']
+    # Target inventory = demand * WOC + safety buffer
+    target_inv = D * woc_target + S
+    # Order quantity = needed to reach target inventory
+    Q = max(target_inv - prev_on, 0)
     on_hand_begin.append(int(prev_on))
+    replenishment.append(int(Q))
+    # Update on-hand for next period (start + receipt - demand)
     prev_on = prev_on + Q - D
 
+# Assign results
+df_fc['On_Hand_Begin'] = on_hand_begin
 df_fc['Replenishment'] = replenishment
-ndx = on_hand_begin
-# Assign computed on-hand at the start of each week
-df_fc['On_Hand_Begin'] = ndx
-# Weeks of Cover constant by design
-df_fc['Weeks_Of_Cover'] = woc_target
-df_fc['Weeks_Of_Cover'] = woc_target
+# Weeks of Cover = (on-hand + incoming) / demand
+df_fc['Weeks_Of_Cover'] = ((df_fc['On_Hand_Begin'] + df_fc['Replenishment']) / df_fc['Sell-Out Units']).round(2)
 
 # Merge Amazon upstream sell-out forecast
 if upstream_path:
