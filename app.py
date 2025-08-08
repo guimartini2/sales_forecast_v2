@@ -170,14 +170,19 @@ df_fc[forecast_label] = df_fc['yhat'].round(0).astype(int)
 
 # Load inventory snapshot dynamically
 df_inv = pd.read_csv(inv_path, skiprows=1)
+# Dynamic detection of on-hand column
 inv_cols = [c for c in df_inv.columns if re.search(r'on hand|sellable', c, re.IGNORECASE)]
 if not inv_cols:
-    st.error("No inventory 'on hand' column found.")
+    st.error("No inventory 'On Hand' column found.")
     st.stop()
 oh_raw = df_inv[inv_cols[0]].iloc[0]
-init_inv = int(str(oh_raw).replace(',', '')) if isinstance(oh_raw, str) else int(oh_raw)
+# Parse initial inventory, stripping commas
+try:
+    init_inv = int(str(oh_raw).replace(",", ""))
+except:
+    init_inv = int(oh_raw)
 
-# Compute dynamic safety stock using CV
+# Compute dynamic safety stock using CV using CV
 sigma = df_hist['y'].std()
 mean_d = df_hist['y'].mean()
 cv = sigma / mean_d if mean_d > 0 else 0
