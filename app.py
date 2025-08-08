@@ -97,6 +97,15 @@ if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to generate the replenishment plan.")
     st.stop()
 
+# Resolve file paths
+default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
+default_upstream = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
+sales_path = sales_file if sales_file else (default_sales if os.path.exists(default_sales) else None)
+upstream_path = fcst_file if fcst_file else (default_upstream if os.path.exists(default_upstream) else None)
+if not sales_path:
+    st.error("Sales history file is required.")
+    st.stop()
+
 # Load sales history
 df_raw = pd.read_csv(sales_path, skiprows=1)
 # Parse week start
