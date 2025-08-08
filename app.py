@@ -102,10 +102,9 @@ if not st.button("Run Forecast"):
 
 # Display product details after forecast trigger
 if sku_input or product_name:
-    st.markdown(
-        f"**Product Name:** {product_name if product_name else 'N/A'}  
-        **SKU:** {sku_input if sku_input else 'N/A'}"
-    )
+    details = f"**Product Name:** {product_name or 'N/A'}  
+**SKU:** {sku_input or 'N/A'}"
+    st.markdown(details)
 
 # Default file paths
 default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
