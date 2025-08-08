@@ -136,7 +136,7 @@ start_fc = max(
     last_date + timedelta(weeks=1),
     pd.to_datetime(datetime.now().date()) + timedelta(weeks=1)
 )
-future_idx = pd.date_range(start=start_fc, periods=periods, freq='W')
+future_idx = pd.date_range(start=start_fc, periods=periods, freq='W-MON')
 
 # Generate forecast
 if model_choice=='Prophet':
@@ -156,8 +156,8 @@ else:
 # Rename forecast column
 df_fc[forecast_label]=df_fc['yhat'].round(0).astype(int)
 
-# Override with Amazon sell-out forecast where available
-if up_path:
+# (disabled) Override with Amazon sell-out forecast where available
+if False and up_path:
     try:
         df_up_raw = pd.read_csv(up_path)
     except pd.errors.EmptyDataError:
@@ -187,36 +187,57 @@ if up_path:
             df_fc[forecast_label] = df_fc['Amazon_Sellout_Forecast'].fillna(df_fc[forecast_label]).astype(int)
 
 
-# Override with Amazon sell-out forecast where available
+# Override with Amazon sell-out forecast where available (robust loader)
 if up_path:
-    try:
-        df_up_raw = pd.read_csv(up_path, skiprows=1)
-    except pd.errors.EmptyDataError:
-        st.warning("⚠️ Amazon sell-out forecast file is empty; skipping upstream merge.")
-        df_up_raw = pd.DataFrame()
-    except Exception:
+    df_up_raw = None
+    # Try multiple separators and skiprows to handle different exports
+    for skip in [0, 1, 2]:
+        for sep in [',', ';', '	', '|']:
+            try:
+                tmp = pd.read_csv(up_path, sep=sep, skiprows=skip, engine='python')
+                if not tmp.empty and tmp.shape[1] > 1:
+                    df_up_raw = tmp
+                    break
+            except Exception:
+                continue
+        if df_up_raw is not None:
+            break
+    if df_up_raw is None:
         df_up_raw = pd.DataFrame()
 
-    if not df_up_raw.empty:
+    if df_up_raw.empty:
+        st.warning('⚠️ Amazon sell-out forecast file is empty or unreadable; skipping upstream merge.')
+    else:
+        # Use first row by default (if the file contains multiple SKUs)
+        row0 = df_up_raw.iloc[0]
         rec = []
-        for c in df_up_raw.columns:
-            m = re.search(r"\((\d{1,2} [A-Za-z]+)\)", c)
-            if m:
-                dt = pd.to_datetime(
-                    f"{m.group(1)} {datetime.now().year}",
-                    format="%d %b %Y", errors='coerce'
-                )
-                val = pd.to_numeric(str(df_up_raw[c].iloc[0]).replace(",", ""), errors='coerce')
+        for col in df_up_raw.columns:
+            col_str = str(col)
+            dt = pd.NaT
+            # Try parentheses content first, then fall back to the full string
+            if '(' in col_str and ')' in col_str:
+                inside = col_str.split('(')[-1].split(')')[0]
+                dt = pd.to_datetime(inside + ' ' + str(datetime.now().year), format='%d %b %Y', errors='coerce')
+                if pd.isna(dt):
+                    dt = pd.to_datetime(inside, errors='coerce')
+            else:
+                dt = pd.to_datetime(col_str, errors='coerce')
+
+            if pd.notna(dt):
+                val = pd.to_numeric(str(row0[col]).replace(',', ''), errors='coerce')
                 if pd.notna(val):
-                    rec.append({"Week_Start": dt, "Amazon_Sellout_Forecast": int(round(val))})
+                    rec.append({'Week_Start': dt, 'Amazon_Sellout_Forecast': int(round(val))})
+
         if rec:
-            df_up = pd.DataFrame(rec).sort_values("Week_Start")
-            df_fc = df_fc.merge(df_up, on="Week_Start", how="left")
-            df_fc[forecast_label] = (
-                df_fc["Amazon_Sellout_Forecast"]
-                .fillna(df_fc[forecast_label])
-                .astype(int)
-            )
+            df_up = pd.DataFrame(rec).dropna(subset=['Week_Start'])
+            # Align both sides to Monday week-start so keys match
+            df_up['Week_Start'] = pd.to_datetime(df_up['Week_Start']).dt.to_period('W-MON').start_time
+            df_fc['Week_Start'] = pd.to_datetime(df_fc['Week_Start']).dt.to_period('W-MON').start_time
+            # If multiple columns mapped to the same week, sum them
+            df_up = df_up.groupby('Week_Start', as_index=False)['Amazon_Sellout_Forecast'].sum().sort_values('Week_Start')
+            # Merge and override
+            df_fc = df_fc.merge(df_up, on='Week_Start', how='left')
+            df_fc[forecast_label] = df_fc['Amazon_Sellout_Forecast'].fillna(df_fc[forecast_label]).astype(int)
 
 # Compute projected sales
 df_fc['Projected_Sales'] = (df_fc[forecast_label] * unit_price).round(2)
