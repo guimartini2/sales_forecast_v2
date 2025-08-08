@@ -97,12 +97,6 @@ if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to generate the replenishment plan.")
     st.stop()
 
-# Sidebar inputs block unchanged
-st.markdown("---")
-if not st.button("Run Forecast"):
-    st.info("Click 'Run Forecast' to generate the replenishment plan.")
-    st.stop()
-
 # Load sales history
 df_raw = pd.read_csv(sales_path, skiprows=1)
 # Parse week start
@@ -250,7 +244,4 @@ table_cols = ['Date'] + metrics + ['On_Hand_Begin', 'Weeks_Of_Cover']
 display_cols = [c for c in table_cols if c in df_fc.columns]
 st.dataframe(df_fc[display_cols])
 
-st.markdown(f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",unsafe_allow_html=True)
-display_cols=[c for c in ['Date']+metrics+['On_Hand_Begin','Weeks_Of_Cover'] if c in df_fc]
-st.dataframe(df_fc[display_cols])
 st.markdown(f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",unsafe_allow_html=True)
