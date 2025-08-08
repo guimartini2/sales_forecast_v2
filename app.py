@@ -180,8 +180,17 @@ inv_df = pd.DataFrame({
 
 # Combine results
 result = fcst_df.merge(inv_df, on='Week_Start')
-result['Weeks_Of_Cover'] = result['Inventory_On_Hand'] / result[forecast_col]
-result['Sell_In_Forecast'] = result['Inventory_On_Hand'] / woc_target
+# Round to whole units
+numeric_cols = [forecast_col, 'Inventory_On_Hand']
+if 'Upstream_Forecast' in result.columns:
+    numeric_cols.append('Upstream_Forecast')
+# Weeks_Of_Cover may be fractional, round to 2 decimal
+result['Weeks_Of_Cover'] = (result['Inventory_On_Hand'] / result[forecast_col]).round(2)
+# Round forecasts and inventory to integers
+result[forecast_col] = result[forecast_col].round(0).astype(int)
+result['Inventory_On_Hand'] = result['Inventory_On_Hand'].round(0).astype(int)
+# Sell-in forecast as integer
+result['Sell_In_Forecast'] = (result['Inventory_On_Hand'] / woc_target).round(0).astype(int)
 
 # Upstream forecast merge
 if fcst_path:
@@ -202,10 +211,13 @@ if fcst_path:
                 val = float(val_str)
             except:
                 continue
-            rec.append({'Week_Start': ds, 'Upstream_Forecast': val})
+            rec.append({'Week_Start': ds, 'Upstream_Forecast': round(val)})
     if rec:
         upstream_df = pd.DataFrame(rec)
         result = result.merge(upstream_df, on='Week_Start', how='left')
+
+# Format date for display
+result['Formatted_Week_Start'] = result['Week_Start'].dt.strftime('%d-%m-%Y')
 
 # Display chart
 st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
@@ -219,6 +231,7 @@ if PLOTLY_INSTALLED:
         title="Sell-In vs Demand vs Inventory"
     )
     fig.update_layout(legend_title_text='')
+    fig.update_xaxes(tickformat="%d-%m-%Y")
     fig.update_traces(
         selector=dict(name=forecast_col),
         line=dict(color=AMZ_ORANGE, dash='dash')
@@ -233,13 +246,14 @@ if PLOTLY_INSTALLED:
     )
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.line_chart(result.set_index('Week_Start')[metrics])
+    basic_df = result.set_index('Week_Start')[metrics]
+    st.line_chart(basic_df)
 
 # Display table
-display_cols = ['Week_Start', forecast_col, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
+display_cols = ['Formatted_Week_Start', forecast_col, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
 if 'Upstream_Forecast' in result.columns:
     display_cols.insert(3, 'Upstream_Forecast')
-st.dataframe(result[display_cols].round(2))
+st.dataframe(result[display_cols])
 
 # Footer
 st.markdown(
