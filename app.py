@@ -234,8 +234,11 @@ else:
     st.line_chart(basic_df)
 
 # Display table
-display_cols = ['Formatted_Week_Start', forecast_col, 'Amazon_Sellout_Forecast', 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
-st.dataframe(result[display_cols])
+# Build display columns dynamically
+base_cols = ['Formatted_Week_Start', forecast_col, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
+if 'Amazon_Sellout_Forecast' in result.columns:
+    base_cols.insert(2, 'Amazon_Sellout_Forecast')
+st.dataframe(result[base_cols])
 
 # Footer
 st.markdown(
