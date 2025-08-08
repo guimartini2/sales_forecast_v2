@@ -182,8 +182,12 @@ else:
     st.line_chart(result.set_index('Week_Start')[metrics])
 
 # Display table
+# Define columns to show in the table
 display_cols = ['Week_Start', y_col, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
-if 'Upstream_Forecast' in result: display_cols.insert(3,'Upstream_Forecast')
+# Insert Upstream_Forecast column if it exists
+if 'Upstream_Forecast' in result.columns:
+    display_cols.insert(3, 'Upstream_Forecast')
+# Render the table
 st.dataframe(result[display_cols].round(2))
 
 # Footer
