@@ -6,17 +6,25 @@ Dependencies (add to requirements.txt):
 streamlit>=1.0
 pandas>=1.3
 numpy>=1.21
+regex
 # At least one forecasting engine
 prophet>=1.0    # or fbprophet>=0.7
 statsmodels>=0.13
 xgboost>=1.7
 """
 
+import os
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-# Check availability of optional forecasting libraries
+# Default file paths
+DEFAULT_SALES = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
+DEFAULT_INVENTORY = "/mnt/data/Inventory_ASIN_Manufacturing_Retail_UnitedStates_Custom_8-6-2025_8-6-2025.csv"
+DEFAULT_FORECAST = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
+
+# Check forecasting libraries
 PROPHET_INSTALLED = False
 try:
     from prophet import Prophet
@@ -26,33 +34,57 @@ except ImportError:
         from fbprophet import Prophet
         PROPHET_INSTALLED = True
     except ImportError:
-        PROPHET_INSTALLED = False
-
+        pass
 ARIMA_INSTALLED = False
 try:
     from statsmodels.tsa.arima.model import ARIMA
     ARIMA_INSTALLED = True
 except ImportError:
-    ARIMA_INSTALLED = False
-
+    pass
 XGB_INSTALLED = False
 try:
     import xgboost as xgb
     XGB_INSTALLED = True
 except ImportError:
-    XGB_INSTALLED = False
+    pass
 
-# Streamlit page configuration
+# Streamlit setup
 st.set_page_config(page_title="Amazon Sell-In Forecast", layout="wide")
-st.title("Amazon SKU-Level Sell-In Forecast")
+st.title("Amazon Sell-In Forecast by ASIN")
 
-# Sidebar: Data uploads
-st.sidebar.header("Data Inputs")
-history_file = st.sidebar.file_uploader("Upload sell-out history (CSV)", type=["csv"])
-inventory_file = st.sidebar.file_uploader("Upload inventory levels (CSV)", type=["csv"])
-upstream_file = st.sidebar.file_uploader("Upload existing sell-out forecast (CSV, optional)", type=["csv"])
+# Sidebar: file inputs or defaults
+st.sidebar.header("Data Inputs (optional override)")
+sales_file = st.sidebar.file_uploader("Sales history CSV", type=["csv"])
+inv_file = st.sidebar.file_uploader("Inventory snapshot CSV", type=["csv"])
+fcst_file = st.sidebar.file_uploader("Upstream forecast CSV", type=["csv"])
 
-# Sidebar: Forecast parameters
+# Use defaults if not uploaded
+sales_path = None
+if sales_file is not None:
+    sales_path = sales_file
+elif os.path.exists(DEFAULT_SALES):
+    sales_path = DEFAULT_SALES
+    st.sidebar.markdown(f"Using default sales file: `{DEFAULT_SALES}`")
+else:
+    st.sidebar.error("Sales history file not provided or found.")
+
+inv_path = None
+if inv_file is not None:
+    inv_path = inv_file
+elif os.path.exists(DEFAULT_INVENTORY):
+    inv_path = DEFAULT_INVENTORY
+    st.sidebar.markdown(f"Using default inventory file: `{DEFAULT_INVENTORY}`")
+else:
+    st.sidebar.error("Inventory file not provided or found.")
+
+fcst_path = None
+if fcst_file is not None:
+    fcst_path = fcst_file
+elif os.path.exists(DEFAULT_FORECAST):
+    fcst_path = DEFAULT_FORECAST
+    st.sidebar.markdown(f"Using default forecast file: `{DEFAULT_FORECAST}`")
+
+# Sidebar: parameters
 st.sidebar.header("Forecast Parameters")
 model_options = []
 if PROPHET_INSTALLED:
@@ -61,131 +93,71 @@ if ARIMA_INSTALLED:
     model_options.append("ARIMA")
 if XGB_INSTALLED:
     model_options.append("XGBoost")
-
 if not model_options:
-    st.error("No forecasting libraries are installed. Please install at least one of: prophet, statsmodels, xgboost.")
+    st.error("Install at least one forecasting library: prophet, statsmodels, or xgboost.")
     st.stop()
+model_choice = st.sidebar.selectbox("Model", model_options)
+woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
+# No dynamic events for default files
 
-model_choice = st.sidebar.selectbox("Select forecast model", model_options)
-woc_target = st.sidebar.slider("Target Weeks of Cover", 1.0, 12.0, 4.0, step=0.5)
-# Collect event impacts as CSV text: date,uplift_pct per line
-events_text = st.sidebar.text_area(
-    "Event uplifts (one per line, format: YYYY-MM-DD,Uplift% like 2025-11-25,20)",
-    height=100,
-    key="events_text"
-)
-
-# Trigger forecasting
 if st.sidebar.button("Run Forecast"):
-    # Validate library availability
-    if model_choice == "Prophet" and not PROPHET_INSTALLED:
-        st.error("Prophet library not found. Install with: pip install prophet (or fbprophet).")
-        st.stop()
-    if model_choice == "ARIMA" and not ARIMA_INSTALLED:
-        st.error("statsmodels ARIMA not available. Install with: pip install statsmodels.")
-        st.stop()
-    if model_choice == "XGBoost" and not XGB_INSTALLED:
-        st.error("XGBoost not available. Install with: pip install xgboost.")
-        st.stop()
+    # Read sales history
+    df_sales = pd.read_csv(sales_path, skiprows=1)
+    # parse ds and y
+    df_sales['ds'] = pd.to_datetime(df_sales['Week'].str.split(' - ').str[0].str.strip())
+    df_sales['y'] = df_sales['Ordered Units'].str.replace(',', '').astype(int)
+    hist = df_sales[['ds','y']]
 
-    # Validate required uploads
-    if not history_file or not inventory_file:
-        st.error("Please upload both sell-out history and inventory files to proceed.")
-        st.stop()
+    # Read inventory
+    df_inv = pd.read_csv(inv_path, skiprows=1)
+    # use Sellable On Hand Units
+    oh = df_inv['Sellable On Hand Units'][0]
+    # Read upstream forecast if available
+    upstream = None
+    if fcst_path:
+        df_fc = pd.read_csv(fcst_path, skiprows=1)
+        # melt week cols
+        week_cols = [c for c in df_fc.columns if c.startswith('Week ')]
+        rec = []
+        for col in week_cols:
+            # extract start date
+            m = re.search(r'Week \d+ \((\d+ \w+)', col)
+            if not m: continue
+            start = m.group(1) + ' 2025'
+            ds = pd.to_datetime(start, format='%d %b %Y')
+            val = df_fc[col].iloc[0].replace(',','')
+            yhat = float(val)
+            rec.append({'ds': ds, 'yhat_up': yhat})
+        upstream = pd.DataFrame(rec)
 
-    # Load input CSVs
-    hist = pd.read_csv(history_file, parse_dates=["date"])  # expects: date, sku, units_sold
-    inv = pd.read_csv(inventory_file, parse_dates=["date"])  # expects: date, sku, on_hand
-    if upstream_file:
-        upstream = pd.read_csv(upstream_file, parse_dates=["date"]) .rename(columns={"units_sold":"yhat"})
-
-    # SKU selection
-    skus = hist['sku'].unique().tolist()
-    sku = st.selectbox("Select SKU", skus)
-
-    # Filter data for selected SKU
-    hist_sku = hist.query("sku == @sku")[['date', 'units_sold']].rename(columns={'date':'ds', 'units_sold':'y'})
-    inv_sku = inv.query("sku == @sku")[['date', 'on_hand']]
-
-    # Parse event uplifts
-    events = []
-    for line in events_text.splitlines():
-        parts = line.split(",")
-        if len(parts) != 2:
-            continue
-        date_str, uplift_str = parts[0].strip(), parts[1].strip()
-        try:
-            ds = pd.to_datetime(date_str)
-            uplift = float(uplift_str) / 100.0
-            events.append({'ds': ds, 'uplift': uplift})
-        except Exception:
-            continue
-
-    # Forecast horizon
-    periods = 12  # in weeks
-
-    # Run forecast
-    if model_choice == "Prophet":
-        df_prophet = hist_sku.copy()
+    # Simple forecast: use chosen model
+    periods = 12
+    if model_choice == 'Prophet':
         m = Prophet(weekly_seasonality=True)
-        if events:
-            event_df = pd.DataFrame(events)
-            m.add_regressor('uplift')
-            df_prophet = df_prophet.merge(event_df, on='ds', how='left').fillna({'uplift':0})
-        m.fit(df_prophet)
+        m.fit(hist)
         future = m.make_future_dataframe(periods=periods, freq='W')
-        if events:
-            future = future.merge(event_df, on='ds', how='left').fillna({'uplift':0})
         forecast = m.predict(future)[['ds','yhat']].tail(periods)
+    elif model_choice == 'ARIMA':
+        hist_w = hist.set_index('ds').resample('W-SUN').sum().reset_index()
+        model = ARIMA(hist_w['y'], order=(1,1,1)).fit()
+        f = model.get_forecast(steps=periods)
+        idx = pd.date_range(start=hist_w['ds'].max()+pd.Timedelta(weeks=1), periods=periods, freq='W-SUN')
+        forecast = pd.DataFrame({'ds': idx, 'yhat': f.predicted_mean.values})
+    else:
+        # simple persistence baseline
+        last = hist['y'].iloc[-1]
+        idx = pd.date_range(start=hist['ds'].max()+pd.Timedelta(weeks=1), periods=periods, freq='W')
+        forecast = pd.DataFrame({'ds': idx, 'yhat': last})
 
-    elif model_choice == "ARIMA":
-        hist_weekly = hist_sku.set_index('ds').resample('W-SUN').sum().reset_index()
-        arima_model = ARIMA(hist_weekly['y'], order=(1,1,1))
-        arima_res = arima_model.fit()
-        fcst_res = arima_res.get_forecast(steps=periods)
-        last_date = hist_weekly['ds'].max()
-        fcst_index = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=periods, freq='W-SUN')
-        forecast = pd.DataFrame({'ds': fcst_index, 'yhat': fcst_res.predicted_mean.values})
+    # Build inventory series
+    inv_df = pd.DataFrame({'ds': forecast['ds'], 'on_hand': oh})
+    # Merge all
+    result = forecast.merge(inv_df, on='ds')
+    result['woc'] = result['on_hand'] / result['yhat']
+    if upstream is not None:
+        result = result.merge(upstream, on='ds', how='left')
 
-    else:  # XGBoost
-        df_ml = hist_sku.copy()
-        df_ml['week'] = df_ml['ds'].dt.isocalendar().week
-        df_ml['year'] = df_ml['ds'].dt.year
-        for lag in range(1,5):
-            df_ml[f'lag_{lag}'] = df_ml['y'].shift(lag)
-        df_ml = df_ml.dropna().reset_index(drop=True)
-        cutoff_date = df_ml['ds'].max() - pd.Timedelta(weeks=periods)
-        train = df_ml[df_ml['ds'] <= cutoff_date]
-        test_dates = pd.date_range(start=df_ml['ds'].max() + pd.Timedelta(weeks=1), periods=periods, freq='W')
-        features = [c for c in train.columns if c.startswith('lag_')] + ['week','year']
-        xgb_model = xgb.XGBRegressor(n_estimators=100)
-        xgb_model.fit(train[features], train['y'])
-        preds = []
-        recent_vals = train['y'].tolist()[-4:]
-        for dt in test_dates:
-            wk, yr = dt.isocalendar().week, dt.year
-            feat_vals = recent_vals[-4:] + [wk, yr]
-            pred = xgb_model.predict(np.array(feat_vals).reshape(1, -1))[0]
-            preds.append({'ds': dt, 'yhat': pred})
-            recent_vals.append(pred)
-        forecast = pd.DataFrame(preds)
-
-    # Merge inventory and compute WOC
-    inv_weekly = (
-        inv_sku.set_index('date')
-               .resample('W-SUN')
-               .last()
-               .ffill()
-               .reset_index()
-               .rename(columns={'date':'ds'})
-    )
-    merged = forecast.merge(inv_weekly, on='ds', how='left')
-    merged['woc'] = merged['on_hand'] / merged['yhat']
-    if upstream_file:
-        upstream_sku = upstream.query("sku == @sku")[['date','yhat']].rename(columns={'date':'ds'})
-        merged = merged.merge(upstream_sku, on='ds', how='left', suffixes=('','_upstream'))
-
-    # Display results
-    st.subheader(f"Weekly Sell-In Forecast for SKU: {sku}")
-    st.line_chart(merged.set_index('ds')[['yhat','on_hand']])
-    st.dataframe(merged[['ds','yhat','on_hand','woc']].round(2))
+    # Display
+    st.subheader("Forecast Results")
+    st.line_chart(result.set_index('ds')[['yhat','on_hand', 'yhat_up'] if upstream is not None else ['yhat','on_hand']])
+    st.dataframe(result.round(2))
