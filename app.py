@@ -181,7 +181,7 @@ inv_df = pd.DataFrame({
 # Combine results
 result = fcst_df.merge(inv_df, on='Week_Start')
 # Round to whole units
-numeric_cols = [forecast_col, 'Inventory_On_Hand']
+numeric_cols = [forecast_col]
 if 'Upstream_Forecast' in result.columns:
     numeric_cols.append('Upstream_Forecast')
 # Weeks_Of_Cover may be fractional, round to 2 decimal
@@ -221,24 +221,20 @@ result['Formatted_Week_Start'] = result['Week_Start'].dt.strftime('%d-%m-%Y')
 
 # Display chart
 st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
-metrics = [forecast_col, 'Inventory_On_Hand', 'Sell_In_Forecast']
+metrics = [forecast_col, 'Sell_In_Forecast']
 if 'Upstream_Forecast' in result.columns:
-    metrics.insert(2, 'Upstream_Forecast')
+    metrics.insert(1, 'Upstream_Forecast')
 if PLOTLY_INSTALLED:
     fig = px.line(
         result, x='Week_Start', y=metrics,
         labels={'value': y_label, 'variable': 'Metric'},
-        title="Sell-In vs Demand vs Inventory"
+        title="Sell-In vs Demand"
     )
     fig.update_layout(legend_title_text='')
     fig.update_xaxes(tickformat="%d-%m-%Y")
     fig.update_traces(
         selector=dict(name=forecast_col),
         line=dict(color=AMZ_ORANGE, dash='dash')
-    )
-    fig.update_traces(
-        selector=dict(name='Inventory_On_Hand'),
-        line=dict(color=AMZ_BLUE)
     )
     fig.update_traces(
         selector=dict(name='Sell_In_Forecast'),
@@ -252,7 +248,7 @@ else:
 # Display table
 display_cols = ['Formatted_Week_Start', forecast_col, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
 if 'Upstream_Forecast' in result.columns:
-    display_cols.insert(3, 'Upstream_Forecast')
+    display_cols.insert(2, 'Upstream_Forecast')
 st.dataframe(result[display_cols])
 
 # Footer
