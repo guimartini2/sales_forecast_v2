@@ -62,14 +62,14 @@ AMZ_BLUE = "#146EB4"
 
 # Page config
 st.set_page_config(
-    page_title="Amazon Sell-In Forecast",
+    page_title="Amazon Replenishment Forecast",
     page_icon=AMZ_LOGO,
     layout="wide"
 )
 st.markdown(
     f"<div style='display:flex; align-items:center;'>"
     f"<img src='{AMZ_LOGO}' width=100>"
-    f"<h1 style='margin-left:10px; color:{AMZ_BLUE};'>Amazon Sell-In Forecast</h1>"
+    f"<h1 style='margin-left:10px; color:{AMZ_BLUE};'>Amazon Replenishment Forecast</h1>"
     f"</div>",
     unsafe_allow_html=True
 )
@@ -96,210 +96,134 @@ woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
 periods = st.sidebar.number_input("Forecast Horizon (weeks)", min_value=4, max_value=52, value=12)
 
 st.markdown("---")
-
-# Run forecast trigger
-run_button = st.button("Run Forecast")
-if not run_button:
-    st.info("Click 'Run Forecast' to run the sell-in forecast")
+# Run forecast
+if not st.button("Run Forecast"):
+    st.info("Click 'Run Forecast' to generate the replenishment plan.")
     st.stop()
 
-# Default file paths
-DEFAULT_SALES     = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
-DEFAULT_INVENTORY = "/mnt/data/Inventory_ASIN_Manufacturing_Retail_UnitedStates_Custom_8-6-2025_8-6-2025.csv"
-DEFAULT_UPSTREAM  = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
+# Default paths
+default_sales     = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
+default_inventory = "/mnt/data/Inventory_ASIN_Manufacturing_Retail_UnitedStates_Custom_8-6-2025_8-6-2025.csv"
+default_upstream  = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 
-# Resolve file sources
-sales_path = sales_file if sales_file else (DEFAULT_SALES if os.path.exists(DEFAULT_SALES) else None)
-inv_path   = inv_file   if inv_file   else (DEFAULT_INVENTORY if os.path.exists(DEFAULT_INVENTORY) else None)
-upstream_path = fcst_file if fcst_file else (DEFAULT_UPSTREAM if os.path.exists(DEFAULT_UPSTREAM) else None)
+sales_path   = sales_file if sales_file else (default_sales if os.path.exists(default_sales) else None)
+inv_path     = inv_file   if inv_file   else (default_inventory if os.path.exists(default_inventory) else None)
+upstream_path= fcst_file  if fcst_file  else (default_upstream if os.path.exists(default_upstream) else None)
 
 if not sales_path or not inv_path:
-    st.error("Sales history and inventory files are required.")
+    st.error("Sales history and inventory snapshot files are required.")
     st.stop()
 
 # Load sales data
-# Skip metadata row and read raw data
-raw_sales = pd.read_csv(sales_path, skiprows=1)
-# Dynamically find the week column (first column)
-week_col = raw_sales.columns[0]
-# Parse week start date from the first part of the week range
-raw_sales['Week_Start'] = pd.to_datetime(
-    raw_sales[week_col].astype(str).str.split(' - ').str[0].str.strip(),
-    errors='coerce'
+df_raw = pd.read_csv(sales_path, skiprows=1)
+week_col = df_raw.columns[0]
+df_raw['Week_Start'] = pd.to_datetime(
+    df_raw[week_col].astype(str).str.split(' - ').str[0].str.strip(), errors='coerce'
 )
-# Drop rows without valid dates
-df_sales = raw_sales.dropna(subset=['Week_Start']).copy()
-# Select metric column based on projection type (dynamic)
-cols = raw_sales.columns.tolist()
-if projection_type == 'Units':
-    # find first column name containing 'unit' (case-insensitive)
-    unit_cols = [c for c in cols if re.search(r'unit', c, re.IGNORECASE)]
-    if not unit_cols:
-        st.error("No 'Units' column found in sales data.")
-        st.stop()
-    y_col = unit_cols[0]
+df_raw.dropna(subset=['Week_Start'], inplace=True)
+
+# Select metric
+cols = df_raw.columns.tolist()
+if projection_type=='Units':
+    unit_cols = [c for c in cols if re.search(r'unit',c,re.IGNORECASE)]
+    y_col = unit_cols[0] if unit_cols else cols[1]
     forecast_label = 'Sell-Out Units'
-    y_label = 'Units'
+    y_label='Units'
 else:
-    # find 'sales' column
-    sales_cols = [c for c in cols if re.search(r'sales', c, re.IGNORECASE)]
-    if sales_cols:
-        y_col = sales_cols[0]
-        forecast_label = 'Sell-Out Sales'
-        y_label = 'Sales $'
-    else:
-        # fallback to units
-        unit_cols = [c for c in cols if re.search(r'unit', c, re.IGNORECASE)]
-        if not unit_cols:
-            st.error("No 'Sales' or 'Units' column found in sales data.")
-            st.stop()
-        y_col = unit_cols[0]
-        forecast_label = 'Sell-Out Units'
-        y_label = 'Units'
-# Clean and cast projection metric to numeric with coercion
-numeric_series = df_sales[y_col].astype(str).str.replace('[^0-9.]', '', regex=True)
-# Convert to numeric, set invalid parsing as zero
-df_sales['y'] = pd.to_numeric(numeric_series, errors='coerce').fillna(0)
-# Prepare final sales DataFrame
-hist = df_sales[['Week_Start','y']]
+    sales_cols=[c for c in cols if re.search(r'sales',c,re.IGNORECASE)]
+    y_col = sales_cols[0] if sales_cols else unit_cols[0]
+    forecast_label='Sell-Out Sales'
+    y_label='Sales $'
 
-# Historical data cutoff
-today = pd.to_datetime(datetime.now().date())
-hist = df_sales[df_sales['Week_Start'] <= today]
-if hist.empty:
-    st.error("No historical data before or on today’s date.")
+# Parse and clean
+df_raw['y'] = pd.to_numeric(
+    df_raw[y_col].astype(str).str.replace('[^0-9.]','',regex=True), errors='coerce'
+).fillna(0)
+df_hist = df_raw[['Week_Start','y']]
+df_hist = df_hist[df_hist['Week_Start']<=pd.to_datetime(datetime.now().date())]
+if df_hist.empty:
+    st.error("No valid historical data.")
     st.stop()
-last_hist = hist['Week_Start'].max()
-start_fcst = max(last_hist + timedelta(weeks=1), today + timedelta(weeks=1))
-future_dates = pd.date_range(start=start_fcst, periods=periods, freq='W')
 
-# Forecast implementation
-if model_choice == 'Prophet':
-    model = Prophet(weekly_seasonality=True)
-    model.fit(hist.rename(columns={'Week_Start':'ds'}))
-    future = pd.DataFrame({'ds': future_dates})
-    fcst_df = model.predict(future)[['ds','yhat']].rename(columns={'ds':'Week_Start'})
-elif model_choice == 'ARIMA':
-    hw = hist.set_index('Week_Start').resample('W-SUN').sum().reset_index()
-    ar_model = ARIMA(hw['y'], order=(1,1,1)).fit()
-    preds = ar_model.get_forecast(steps=periods)
-    fcst_df = pd.DataFrame({'Week_Start': future_dates, 'yhat': preds.predicted_mean.values})
+# Forecast generation
+last_hist=df_hist['Week_Start'].max()
+start_fc=max(last_hist+timedelta(weeks=1),pd.to_datetime(datetime.now().date())+timedelta(weeks=1))
+future_idx=pd.date_range(start=start_fc,periods=periods,freq='W')
+
+if model_choice=='Prophet':
+    m=Prophet(weekly_seasonality=True)
+    m.fit(df_hist.rename(columns={'Week_Start':'ds'}))
+    fut=pd.DataFrame({'ds':future_idx})
+    df_fc=m.predict(fut)[['ds','yhat']].rename(columns={'ds':'Week_Start'})
+elif model_choice=='ARIMA':
+    tmp=df_hist.set_index('Week_Start').resample('W').sum().reset_index()
+    ar=ARIMA(tmp['y'],order=(1,1,1)).fit()
+    pr=ar.get_forecast(steps=periods)
+    df_fc=pd.DataFrame({'Week_Start':future_idx,'yhat':pr.predicted_mean.values})
 else:
-    last_val = hist['y'].iloc[-1]
-    fcst_df = pd.DataFrame({'Week_Start': future_dates, 'yhat': last_val})
-# Rename forecast column to Sell-Out label
-fcst_df = fcst_df.rename(columns={'yhat': forecast_label})
-# Round the model Sell-Out Forecast to integer units
-fcst_df[forecast_label] = fcst_df[forecast_label].round(0).astype(int)
+    last=df_hist['y'].iloc[-1]
+    df_fc=pd.DataFrame({'Week_Start':future_idx,'yhat':last})
 
-# Load initial inventory
-df_inv = pd.read_csv(inv_path, skiprows=1)
-oh_raw = df_inv['Sellable On Hand Units'].iloc[0]
-try:
-    init_inv = int(str(oh_raw).replace(',',''))
-except:
-    init_inv = float(str(oh_raw).replace(',',''))
+# Round and rename forecast
+df_fc[forecast_label]=df_fc['yhat'].round(0).astype(int)
 
-# Compute dynamic inventory and sell-in to maintain constant WOC
-desired_inv = init_inv
-inv_list = []
-sellin_list = []
-prev_inv = init_inv
-for _, row in fcst_df.iterrows():
-    demand = row[forecast_label]
-    # desired ending inventory to hit WOC target
-    desired_inv = demand * woc_target
-    # sell-in needed this week to reach desired inventory
-    sell_in = desired_inv - (prev_inv - demand)
-    # record values
-    inv_list.append(int(round(desired_inv)))
-    sellin_list.append(int(round(sell_in)))
-    # update for next iteration
-    prev_inv = desired_inv
+# Inventory and variability
+init_inv = int(str(pd.read_csv(inv_path,skiprows=1)['Sellable On Hand Units'].iloc[0]).replace(',',''))
+# Compute historical demand variability
+sigma = df_hist['y'].std()
+lead_time_weeks= woc_target
+safety_stock = sigma * np.sqrt(lead_time_weeks)
 
-# Build result DataFrame
-result = fcst_df.copy()
-result['Inventory_On_Hand'] = inv_list
-result['Sell_In_Forecast'] = sellin_list
-# Weeks of Cover now constant by design
-result['Weeks_Of_Cover'] = woc_target
+# Replenishment calculation: Q = D+S - OnHand
+# For each week: D = forecast, S = safety, OnHand carries forward
+df_fc['Safety_Stock']=safety_stock.round(0).astype(int)
+df_fc['On_Hand_Begin']=0
+df_fc['Replenishment']=0
+prev_onhand=init_inv
+for i,row in df_fc.iterrows():
+    D=row[forecast_label]
+    S=row['Safety_Stock']
+    Q=max(D+S - prev_onhand,0)
+    df_fc.at[i,'Replenishment']=int(Q)
+    inv_end=prev_onhand+Q-D
+    df_fc.at[i,'On_Hand_Begin']=int(prev_onhand)
+    prev_onhand=inv_end
 
-# Load and merge Amazon sell-out forecast
+df_fc['Weeks_Of_Cover']= ((df_fc['On_Hand_Begin']+df_fc['Replenishment'])/df_fc[forecast_label]).round(2)
+
+# Merge Amazon upstream if available
 if upstream_path:
-    df_up = pd.read_csv(upstream_path, skiprows=1)
-    rec = []
-    for col in df_up.columns:
-        if col.startswith('Week '):
-            m = re.search(r'\((\d{1,2} [A-Za-z]+)', col)
-            if not m:
-                continue
-            date_str = m.group(1) + ' ' + str(datetime.now().year)
-            try:
-                ds = pd.to_datetime(date_str, format='%d %b %Y')
-            except:
-                continue
-            val_str = str(df_up[col].iloc[0]).replace(',','')
-            try:
-                val = round(float(val_str))
-            except:
-                continue
-            rec.append({'Week_Start': ds, 'Amazon_Sellout_Forecast': val})
+    df_up=pd.read_csv(upstream_path,skiprows=1)
+    rec=[]
+    for c in df_up.columns:
+        if c.startswith('Week '):
+            m=re.search(r'\((\d{1,2} [A-Za-z]+)',c)
+            if m:
+                dt=pd.to_datetime(m.group(1)+' '+str(datetime.now().year),format='%d %b %Y',errors='coerce')
+                val=pd.to_numeric(str(df_up[c].iloc[0]).replace(',',''),errors='coerce')
+                rec.append({'Week_Start':dt,'Amazon_Sellout_Forecast':int(round(val))})
     if rec:
-        upstream_df = pd.DataFrame(rec)
-        result = result.merge(upstream_df, on='Week_Start', how='left')
-# Override Sell-Out Units with Amazon’s forecast
-result[forecast_label] = result['Amazon_Sellout_Forecast']
+        updf=pd.DataFrame(rec)
+        df_fc=df_fc.merge(updf,on='Week_Start',how='left')
 
 # Format date for display
-result['Formatted_Week_Start'] = result['Week_Start'].dt.strftime('%d-%m-%Y')
+df_fc['Date']=df_fc['Week_Start'].dt.strftime('%d-%m-%Y')
 
-# Display chart including historical performance
-st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
-
-# Prepare historical series
-hist_series = hist[['Week_Start','y']].copy()
-hist_series = hist_series.rename(columns={'y': f'Historical_{forecast_label}'})
-# Round historical to integer units
-hist_series[f'Historical_{forecast_label}'] = hist_series[f'Historical_{forecast_label}'].round(0).astype(int)
-
-# Merge history and future results for chart
-to_merge = [forecast_label, 'Sell_In_Forecast']
-if 'Amazon_Sellout_Forecast' in result.columns:
-    to_merge.insert(1, 'Amazon_Sellout_Forecast')
-chart_df = pd.merge(
-    hist_series,
-    result[['Week_Start'] + to_merge],
-    on='Week_Start', how='outer'
-).sort_values('Week_Start')
-
-metrics = [f'Historical_{forecast_label}'] + to_merge
+# Plot results
+st.subheader(f"{periods}-Week Replenishment Plan ({projection_type})")
+metrics=[forecast_label,'Safety_Stock','Replenishment']
+if 'Amazon_Sellout_Forecast' in df_fc: metrics.insert(1,'Amazon_Sellout_Forecast')
 
 if PLOTLY_INSTALLED:
-    fig = px.line(
-        chart_df, x='Week_Start', y=metrics,
-        labels={'value': y_label, 'variable':'Metric'},
-        title="Historical vs Forecast vs Sell-In"
-    )
-    fig.update_layout(legend_title_text='')
-    fig.update_xaxes(tickformat="%d-%m-%Y")
-    # style lines
-    fig.update_traces(selector=dict(name=f'Historical_{forecast_label}'), line=dict(color=AMZ_BLUE, dash='solid'))
-    if 'Amazon_Sellout_Forecast' in chart_df.columns:
-        fig.update_traces(selector=dict(name='Amazon_Sellout_Forecast'), line=dict(color=AMZ_BLUE, dash='dash'))
-    fig.update_traces(selector=dict(name=forecast_label), line=dict(color=AMZ_ORANGE, dash='dot'))
-    fig.update_traces(selector=dict(name='Sell_In_Forecast'), line=dict(color=AMZ_ORANGE, dash='solid'))
-    st.plotly_chart(fig, use_container_width=True)
+    fig=px.line(df_fc,x='Week_Start',y=metrics,labels={'value':y_label,'variable':'Metric'},title='Replenishment vs Demand')
+    fig.update_xaxes(tickformat='%d-%m-%Y')
+    st.plotly_chart(fig,use_container_width=True)
 else:
-    st.line_chart(chart_df.set_index('Week_Start')[metrics])
+    st.line_chart(df_fc.set_index('Week_Start')[metrics])
 
 # Display table
-base_cols = ['Formatted_Week_Start', forecast_label, 'Sell_In_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
-if 'Amazon_Sellout_Forecast' in result.columns:
-    base_cols.insert(2, 'Amazon_Sellout_Forecast')
-st.dataframe(result[base_cols])
+cols=['Date',forecast_label,'Amazon_Sellout_Forecast','Safety_Stock','Replenishment','On_Hand_Begin','Weeks_Of_Cover']
+st.dataframe(df_fc[cols])
 
 # Footer
-st.markdown(
-    f"<div style='text-align:center; color:gray; margin-top:20px;'>© {datetime.now().year} Amazon Internal Tool</div>",
-    unsafe_allow_html=True
-)
+st.markdown(f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",unsafe_allow_html=True)
