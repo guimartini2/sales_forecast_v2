@@ -102,7 +102,7 @@ if not st.button("Run Forecast"):
 
 # Display product details after forecast trigger
 if sku_input or product_name:
-    details = f"**Product Name:** {product_name or 'N/A'}  
+    details = f"**Product Name:** {product_name or 'N/A'}
 **SKU:** {sku_input or 'N/A'}"
     st.markdown(details)
 
