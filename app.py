@@ -169,19 +169,30 @@ try:
 except:
     init_inv = float(str(oh_raw).replace(',',''))
 
-# Compute dynamic inventory based on sell-out and sell-in
-sell_in = (init_inv / woc_target)
+# Compute dynamic inventory and sell-in to maintain constant WOC
+# Initialize lists and previous inventory
+desired_inv = init_inv
 inv_list = []
+sellin_list = []
 prev_inv = init_inv
 for _, row in fcst_df.iterrows():
-    inv_list.append(int(prev_inv))
     demand = row[forecast_col]
-    prev_inv = prev_inv - demand + sell_in
+    # desired ending inventory to hit WOC target
+    desired_inv = demand * woc_target
+    # sell-in needed this week to reach desired inventory
+    sell_in = desired_inv - (prev_inv - demand)
+    # record values
+    inv_list.append(int(round(desired_inv)))
+    sellin_list.append(int(round(sell_in)))
+    # update for next iteration
+    prev_inv = desired_inv
 
+# Build result DataFrame
 result = fcst_df.copy()
 result['Inventory_On_Hand'] = inv_list
-result['Sell_In_Forecast'] = int(sell_in)
-result['Weeks_Of_Cover'] = (result['Inventory_On_Hand'] / result[forecast_col]).round(2)
+result['Sell_In_Forecast'] = sellin_list
+# Weeks of Cover now constant by design
+result['Weeks_Of_Cover'] = woc_target
 
 # Load and merge Amazon sell-out forecast
 if upstream_path:
