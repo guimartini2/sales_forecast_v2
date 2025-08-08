@@ -126,8 +126,6 @@ def read_sales_csv(src):
     - Detects dates like 'Start - End' or direct date.
     - Returns a DataFrame with columns: ['Week_Start', <metric cols>...]
     """
-    # If path-like string provided and exists, pass it through; if UploadedFile, rewind before every attempt
-    attempts = []
     for skip in (0, 1):
         try:
             _maybe_seek_start(src)
@@ -145,10 +143,10 @@ def read_sales_csv(src):
             dates = pd.to_datetime(starts, errors="coerce")
             t["Week_Start"] = dates
             t = t.dropna(subset=["Week_Start"])
-            if t["Week_Start"].notna().sum() >= 4:  # need enough points
+            if t["Week_Start"].notna().sum() >= 4:
                 return t
-        except Exception as e:
-            attempts.append((skip, str(e)))
+        except Exception:
+            pass
 
     st.error("Could not parse Sales history CSV; please verify the header and first column are dates (or 'Start - End').")
     st.stop()
@@ -159,22 +157,17 @@ def try_parse_any_date(text):
     Returns pd.Timestamp or NaT.
     """
     s = str(text).strip()
-    # Attempt explicit formats first
     for fmt in ("%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y"):
         d = pd.to_datetime(s, format=fmt, errors="coerce")
         if pd.notna(d):
             return d
-    # Fallback: let pandas guess
     return pd.to_datetime(s, errors="coerce")
 
 def read_amazon_forecast_csv(src):
     """
     Robust reader for Amazon Sell-Out Forecast (wide headers containing dates).
-    - Tries multiple separators and skiprows
-    - Parses dates from parentheses if present, else from full header
-    - Aggregates duplicate week columns
     Returns DataFrame with columns: ['Week_Start', 'Amazon_Sellout_Forecast']
-    or an empty DataFrame if cannot parse.
+    or empty DataFrame if cannot parse.
     """
     df_raw = None
     for skip in (0, 1, 2):
@@ -193,17 +186,14 @@ def read_amazon_forecast_csv(src):
     if df_raw is None or df_raw.empty:
         return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"])
 
-    # Use first row (assume one SKU per file; adapt as needed)
     row0 = df_raw.iloc[0]
     rec = []
     year_now = datetime.now().year
 
     for col in df_raw.columns:
         col_str = str(col)
-        # Prefer content inside parentheses, e.g., "(12 Jan)" or "(12 January)"
         if "(" in col_str and ")" in col_str:
             inside = col_str.split("(")[-1].split(")")[0].strip()
-            # Try with current year appended, then raw
             dt = try_parse_any_date(f"{inside} {year_now}")
             if pd.isna(dt):
                 dt = try_parse_any_date(inside)
@@ -219,16 +209,14 @@ def read_amazon_forecast_csv(src):
         return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"])
 
     df_up = pd.DataFrame(rec).dropna(subset=["Week_Start"])
-    # Align to Monday week start
-    df_up["Week_Start"] = pd.to_datetime(df_up["Week_Start"]).dt.to_period("W-MON").start_time
-    # If multiple headers map to the same week, sum them
+    # Align to Monday week start (Series -> Periods -> back to datetimes)
+    df_up["Week_Start"] = pd.to_datetime(df_up["Week_Start"]).dt.to_period("W-MON").dt.start_time
     df_up = df_up.groupby("Week_Start", as_index=False)["Amazon_Sellout_Forecast"].sum().sort_values("Week_Start")
     return df_up
 
 def future_weeks(start_date, periods):
     """Return a DatetimeIndex of Mondays for the requested number of weeks starting AFTER start_date."""
-    # Next Monday after start_date
-    start_fc = (start_date + pd.offsets.Week(weekday=0))  # 0 = Monday
+    start_fc = (start_date + pd.offsets.Week(weekday=0))  # next Monday
     if start_fc <= start_date:
         start_fc = start_fc + pd.offsets.Week(weekday=0)
     return pd.date_range(start=start_fc, periods=periods, freq="W-MON")
@@ -254,7 +242,6 @@ df_raw = read_sales_csv(sales_path)
 # Determine metric column (prefer units/qty)
 candidate = next((c for c in df_raw.columns if re.search(r"(unit|qty|quantity)", str(c), re.IGNORECASE)), None)
 if candidate is None:
-    # fallback: use the first numeric column after Week_Start
     numeric_cols = [c for c in df_raw.columns if c != "Week_Start" and pd.api.types.is_numeric_dtype(df_raw[c])]
     candidate = numeric_cols[0] if numeric_cols else df_raw.columns[1]
 
@@ -262,18 +249,17 @@ y_col = candidate
 forecast_label = "Forecast_Units"
 y_label = "Units"
 
-# Historical series (coerce numeric)
+# Historical series (coerce numeric) — align to W-MON using .dt.start_time
 df_hist = pd.DataFrame({
-    "Week_Start": pd.to_datetime(df_raw["Week_Start"]).dt.to_period("W-MON").start_time,
+    "Week_Start": pd.to_datetime(df_raw["Week_Start"]).dt.to_period("W-MON").dt.start_time,
     "y": pd.to_numeric(
         df_raw[y_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True),
         errors="coerce"
     ).fillna(0),
 })
-# Keep only up to current week
 today = pd.to_datetime(datetime.now().date())
 df_hist = df_hist[df_hist["Week_Start"] <= today]
-df_hist = df_hist.groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")  # ensure weekly and sorted
+df_hist = df_hist.groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
 
 if df_hist.empty or df_hist["y"].sum() == 0:
     st.error("No valid historical data (dates or units).")
@@ -289,23 +275,19 @@ future_idx = future_weeks(max(last_hist_week, today), periods)
 # Generate forecast
 # ----------------------------
 if model_choice == "Prophet":
-    # Prophet expects columns 'ds' and 'y'
     m = Prophet(weekly_seasonality=True)
     m.fit(df_hist.rename(columns={"Week_Start": "ds", "y": "y"}))
     fut = pd.DataFrame({"ds": future_idx})
     df_fc = m.predict(fut)[["ds", "yhat"]].rename(columns={"ds": "Week_Start"})
 elif model_choice == "ARIMA":
-    # Ensure weekly series aligned and fit ARIMA
     tmp = df_hist.set_index("Week_Start").asfreq("W-MON", fill_value=0)
     ar = ARIMA(tmp["y"], order=(1, 1, 1)).fit()
     pr = ar.get_forecast(steps=periods)
     df_fc = pd.DataFrame({"Week_Start": future_idx, "yhat": pr.predicted_mean.values})
 else:
-    # XGB placeholder: naive last observed value
     last_val = float(df_hist["y"].iloc[-1])
     df_fc = pd.DataFrame({"Week_Start": future_idx, "yhat": np.full(len(future_idx), last_val)})
 
-# Round and cast
 df_fc[forecast_label] = df_fc["yhat"].clip(lower=0).round(0).astype(int)
 
 # ----------------------------
@@ -316,7 +298,7 @@ if up_path:
     if df_up.empty:
         st.warning("⚠️ Amazon sell-out forecast file is empty or unreadable; skipping upstream merge.")
     else:
-        df_fc["Week_Start"] = pd.to_datetime(df_fc["Week_Start"]).dt.to_period("W-MON").start_time
+        df_fc["Week_Start"] = pd.to_datetime(df_fc["Week_Start"]).dt.to_period("W-MON").dt.start_time
         df_fc = df_fc.merge(df_up, on="Week_Start", how="left")
         df_fc[forecast_label] = df_fc["Amazon_Sellout_Forecast"].fillna(df_fc[forecast_label]).astype(int)
 
@@ -326,10 +308,9 @@ if up_path:
 df_fc["Projected_Sales"] = (df_fc[forecast_label] * float(unit_price)).round(2)
 
 # ----------------------------
-# Replenishment logic
-# - Use recent average weekly demand for WOC target (more stable than per-week D)
+# Replenishment logic (WOC based on recent average weekly demand)
 # ----------------------------
-hist_window = max(8, min(12, len(df_hist)))  # between 8 and 12 weeks depending on data
+hist_window = max(8, min(12, len(df_hist)))
 avg_weekly_demand = df_hist["y"].tail(hist_window).mean() if hist_window > 0 else df_hist["y"].mean()
 avg_weekly_demand = float(avg_weekly_demand) if pd.notna(avg_weekly_demand) else 0.0
 
@@ -341,18 +322,15 @@ prev = int(init_inv)
 
 for _, r in df_fc.iterrows():
     demand = int(r[forecast_label])
-    # Order enough to reach the target inventory *before* consuming this week's demand
     order_qty = max(int(round(target_inventory - prev)), 0)
     on_hand_begin.append(int(prev))
     replenishments.append(order_qty)
-    # Inventory evolves: add order, then subtract demand
     prev = prev + order_qty - demand
     if prev < 0:
-        prev = 0  # no backorders modeled here
+        prev = 0
 
 df_fc["On_Hand_Begin"] = on_hand_begin
 df_fc["Replenishment"] = replenishments
-# Weeks of cover: avoid div-by-zero
 df_fc["Weeks_Of_Cover"] = np.where(
     df_fc[forecast_label] > 0,
     (df_fc["On_Hand_Begin"] / df_fc[forecast_label]).round(2),
@@ -360,14 +338,13 @@ df_fc["Weeks_Of_Cover"] = np.where(
 )
 
 # Format date for display
-df_fc["Date"] = pd.to_datetime(df_fc["Week_Start"]).dt.strftime("%d-%m-%Y")
+df_fc["Date"] = pd.to_datetime(df_fc["Week_Start"]).strftime("%d-%m-%Y")
 
 # ----------------------------
 # Plot: dual-axis (primary depends on Projection Type)
 # ----------------------------
 st.subheader(f"{periods}-Week Forecast & Replenishment")
 
-# Decide which metric is primary
 if projection_type == "Sales $":
     primary_series_key = "Projected_Sales"
     primary_title = "Sales $"
@@ -381,7 +358,6 @@ else:
 
 if PLOTLY_INSTALLED:
     fig = go.Figure()
-    # Primary axis traces
     fig.add_trace(
         go.Scatter(
             x=df_fc["Week_Start"],
@@ -400,7 +376,6 @@ if PLOTLY_INSTALLED:
             line=dict(color=AMZ_BLUE),
         )
     )
-    # Secondary axis trace (only if different from primary)
     if secondary_series_key != primary_series_key:
         fig.add_trace(
             go.Scatter(
@@ -423,12 +398,11 @@ if PLOTLY_INSTALLED:
     fig.update_xaxes(tickformat="%d-%m-%Y")
     st.plotly_chart(fig, use_container_width=True)
 else:
-    # Fallback: two simple Streamlit charts
     st.line_chart(df_fc.set_index("Week_Start")[[forecast_label, "Replenishment"]])
     st.line_chart(df_fc.set_index("Week_Start")["Projected_Sales"])
 
 # ----------------------------
-# Recap summary table
+# Summary Metrics
 # ----------------------------
 st.subheader("Summary Metrics")
 total_rep = int(df_fc["Replenishment"].sum())
