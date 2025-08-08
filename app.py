@@ -1,7 +1,16 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from prophet import Prophet
+# Prophet import with fallback
+try:
+    from prophet import Prophet
+except ImportError:
+    try:
+        from fbprophet import Prophet
+    except ImportError:
+        raise ImportError(
+            "Prophet library not found. Install with: pip install prophet (or pip install fbprophet)"
+        )
 from statsmodels.tsa.arima.model import ARIMA
 import xgboost as xgb
 
