@@ -102,21 +102,19 @@ woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
 if st.sidebar.button("Run Forecast"):
     # Read sales history
     df_sales = pd.read_csv(sales_path, skiprows=1)
-    # parse ds and y
     df_sales['ds'] = pd.to_datetime(df_sales['Week'].str.split(' - ').str[0].str.strip())
     df_sales['y'] = df_sales['Ordered Units'].str.replace(',', '').astype(int)
     hist = df_sales[['ds','y']]
 
     # Read inventory
     df_inv = pd.read_csv(inv_path, skiprows=1)
-    # parse Sellable On Hand Units as numeric
     oh_raw = df_inv['Sellable On Hand Units'].iloc[0]
     try:
         oh = int(str(oh_raw).replace(',',''))
     except:
         oh = float(str(oh_raw).replace(',',''))
 
-    # Read upstream forecast if available
+    # Read upstream forecast
     upstream = None
     if fcst_path:
         df_fc = pd.read_csv(fcst_path, skiprows=1)
@@ -124,12 +122,12 @@ if st.sidebar.button("Run Forecast"):
         rec = []
         for col in week_cols:
             m = re.search(r'Week \d+ \((\d+ \w+)', col)
-            if not m: continue
+            if not m:
+                continue
             start = m.group(1) + ' 2025'
             ds = pd.to_datetime(start, format='%d %b %Y')
-            val = df_fc[col].iloc[0].replace(',','')
-            yhat = float(val)
-            rec.append({'ds': ds, 'yhat_up': yhat})
+            yhat_val = float(df_fc[col].iloc[0].replace(',',''))
+            rec.append({'ds': ds, 'Upstream_Forecast': yhat_val})
         upstream = pd.DataFrame(rec)
 
     # Forecasting
@@ -141,8 +139,8 @@ if st.sidebar.button("Run Forecast"):
         forecast = m.predict(future)[['ds','yhat']].tail(periods)
     elif model_choice == 'ARIMA':
         hist_w = hist.set_index('ds').resample('W-SUN').sum().reset_index()
-        model = ARIMA(hist_w['y'], order=(1,1,1)).fit()
-        f = model.get_forecast(steps=periods)
+        arima_res = ARIMA(hist_w['y'], order=(1,1,1)).fit()
+        f = arima_res.get_forecast(steps=periods)
         idx = pd.date_range(start=hist_w['ds'].max()+pd.Timedelta(weeks=1), periods=periods, freq='W-SUN')
         forecast = pd.DataFrame({'ds': idx, 'yhat': f.predicted_mean.values})
     else:
@@ -150,15 +148,25 @@ if st.sidebar.button("Run Forecast"):
         idx = pd.date_range(start=hist['ds'].max()+pd.Timedelta(weeks=1), periods=periods, freq='W')
         forecast = pd.DataFrame({'ds': idx, 'yhat': last})
 
-    # Build inventory series and compute WOC
+    # Build result DataFrame
     inv_df = pd.DataFrame({'ds': forecast['ds'], 'on_hand': oh})
     result = forecast.merge(inv_df, on='ds')
-    result['woc'] = result['on_hand'] / result['yhat']
+    result['Weeks_Of_Cover'] = result['on_hand'] / result['yhat']
+    result['Sell_In_Forecast'] = result['on_hand'] / woc_target
     if upstream is not None:
         result = result.merge(upstream, on='ds', how='left')
+    result = result.rename(columns={
+        'ds': 'Week_Start',
+        'yhat': 'Demand_Forecast',
+        'on_hand': 'Inventory_On_Hand'
+    })
 
     # Display results
     st.subheader("Forecast Results")
-    cols = ['yhat','on_hand'] + (['yhat_up'] if upstream is not None else [])
-    st.line_chart(result.set_index('ds')[cols])
-    st.dataframe(result.round(2))
+    display_cols = ['Week_Start', 'Sell_In_Forecast', 'Demand_Forecast', 'Inventory_On_Hand', 'Weeks_Of_Cover']
+    plot_cols = ['Sell_In_Forecast', 'Demand_Forecast', 'Inventory_On_Hand']
+    if upstream is not None:
+        display_cols.insert(3, 'Upstream_Forecast')
+        plot_cols.insert(2, 'Upstream_Forecast')
+    st.line_chart(result.set_index('Week_Start')[plot_cols])
+    st.dataframe(result[display_cols].round(2))
