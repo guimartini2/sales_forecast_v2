@@ -124,6 +124,17 @@ df_raw['Week_Start'] = pd.to_datetime(
     df_raw.iloc[:,0].astype(str).str.split(' - ').str[0].str.strip(), errors='coerce'
 )
 df_raw.dropna(subset=['Week_Start'], inplace=True)
+# Auto-detect SKU/ASIN and Product Name from sales file
+sku_col = next((c for c in df_raw.columns if re.search(r'ASIN|SKU', c, re.IGNORECASE)), None)
+name_col = next((c for c in df_raw.columns if re.search(r'Name|Title|Product', c, re.IGNORECASE)), None)
+sku = df_raw[sku_col].iloc[0] if sku_col else 'N/A'
+product = df_raw[name_col].iloc[0] if name_col else 'N/A'
+
+# Display product details after forecast trigger
+st.markdown(
+    f"**Product:** {product}  <br>**SKU:** {sku}",
+    unsafe_allow_html=True
+)
 
 # Determine metric column
 cols = df_raw.columns.tolist()
