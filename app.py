@@ -175,13 +175,13 @@ inv_cols = [c for c in df_inv.columns if re.search(r'on hand|sellable', c, re.IG
 if not inv_cols:
     st.error("No inventory 'On Hand' column found.")
     st.stop()
-oh_raw = df_inv[inv_cols[0]].iloc[0]
-# Robust parse initial inventory: strip non-digits and convert
-raw_str = str(oh_raw)
-digits = re.sub(r'[^0-9]', '', raw_str)
-init_inv = int(digits) if digits else 0
+# Convert the on-hand column to numeric and sum to get total starting inventory
+on_hand_series = pd.to_numeric(
+    df_inv[inv_cols[0]].astype(str).str.replace('[^0-9]', '', regex=True), errors='coerce'
+).fillna(0).astype(int)
+init_inv = on_hand_series.sum()
 
-# Compute dynamic safety stock using coefficient of variation
+# Compute dynamic safety stock using coefficient of variation using coefficient of variation
 sigma = df_hist['y'].std()
 mean_d = df_hist['y'].mean()
 cv = sigma / mean_d if mean_d > 0 else 0
