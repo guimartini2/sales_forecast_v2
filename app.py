@@ -198,20 +198,40 @@ def extract_product_info(upstream_path: str, is_uploaded: bool = False) -> Tuple
     
     try:
         if is_uploaded:
-            df_up_hd = pd.read_csv(upstream_path, nrows=1)
+            df_up_hd = pd.read_csv(upstream_path, nrows=2)  # Read 2 rows to be safe
         else:
             if not os.path.exists(upstream_path):
                 return sku, product
-            df_up_hd = pd.read_csv(upstream_path, nrows=1)
+            df_up_hd = pd.read_csv(upstream_path, nrows=2)
         
-        # Look for SKU/ASIN columns
-        sku_col = next((c for c in df_up_hd.columns if re.search(r'ASIN|SKU', c, re.IGNORECASE)), None)
-        name_col = next((c for c in df_up_hd.columns if re.search(r'Name|Title|Product', c, re.IGNORECASE)), None)
+        # Look for SKU/ASIN columns - be more specific with search
+        sku_col = None
+        name_col = None
         
-        if sku_col and not df_up_hd[sku_col].empty:
-            sku = str(df_up_hd[sku_col].iloc[0])
-        if name_col and not df_up_hd[name_col].empty:
-            product = str(df_up_hd[name_col].iloc[0])
+        for col in df_up_hd.columns:
+            col_lower = col.lower()
+            # Look for exact matches for SKU/ASIN columns
+            if any(keyword in col_lower for keyword in ['asin', 'sku']) and not any(exclude in col_lower for exclude in ['week', 'date', 'forecast']):
+                sku_col = col
+            # Look for product name columns
+            elif any(keyword in col_lower for keyword in ['name', 'title', 'product']) and not any(exclude in col_lower for exclude in ['week', 'date', 'forecast']):
+                name_col = col
+        
+        # Extract values from the first data row (not header)
+        if sku_col and len(df_up_hd) > 0:
+            sku_value = df_up_hd[sku_col].iloc[0]
+            if pd.notna(sku_value) and str(sku_value).strip() != '':
+                # Make sure it doesn't look like a date or week reference
+                sku_str = str(sku_value).strip()
+                if not re.search(r'week|may|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|\d{1,2}\s*-\s*\d{1,2}', sku_str, re.IGNORECASE):
+                    sku = sku_str
+        
+        if name_col and len(df_up_hd) > 0:
+            name_value = df_up_hd[name_col].iloc[0]
+            if pd.notna(name_value) and str(name_value).strip() != '':
+                name_str = str(name_value).strip()
+                if not re.search(r'week|may|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|\d{1,2}\s*-\s*\d{1,2}', name_str, re.IGNORECASE):
+                    product = name_str
             
     except Exception as e:
         logger.warning(f"Could not extract product info: {str(e)}")
