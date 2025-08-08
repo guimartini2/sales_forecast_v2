@@ -98,7 +98,6 @@ if not model_options:
     st.stop()
 model_choice = st.sidebar.selectbox("Model", model_options)
 woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
-# No dynamic events for default files
 
 if st.sidebar.button("Run Forecast"):
     # Read sales history
@@ -110,17 +109,20 @@ if st.sidebar.button("Run Forecast"):
 
     # Read inventory
     df_inv = pd.read_csv(inv_path, skiprows=1)
-    # use Sellable On Hand Units
-    oh = df_inv['Sellable On Hand Units'][0]
+    # parse Sellable On Hand Units as numeric
+    oh_raw = df_inv['Sellable On Hand Units'].iloc[0]
+    try:
+        oh = int(str(oh_raw).replace(',',''))
+    except:
+        oh = float(str(oh_raw).replace(',',''))
+
     # Read upstream forecast if available
     upstream = None
     if fcst_path:
         df_fc = pd.read_csv(fcst_path, skiprows=1)
-        # melt week cols
         week_cols = [c for c in df_fc.columns if c.startswith('Week ')]
         rec = []
         for col in week_cols:
-            # extract start date
             m = re.search(r'Week \d+ \((\d+ \w+)', col)
             if not m: continue
             start = m.group(1) + ' 2025'
@@ -130,7 +132,7 @@ if st.sidebar.button("Run Forecast"):
             rec.append({'ds': ds, 'yhat_up': yhat})
         upstream = pd.DataFrame(rec)
 
-    # Simple forecast: use chosen model
+    # Forecasting
     periods = 12
     if model_choice == 'Prophet':
         m = Prophet(weekly_seasonality=True)
@@ -144,20 +146,19 @@ if st.sidebar.button("Run Forecast"):
         idx = pd.date_range(start=hist_w['ds'].max()+pd.Timedelta(weeks=1), periods=periods, freq='W-SUN')
         forecast = pd.DataFrame({'ds': idx, 'yhat': f.predicted_mean.values})
     else:
-        # simple persistence baseline
         last = hist['y'].iloc[-1]
         idx = pd.date_range(start=hist['ds'].max()+pd.Timedelta(weeks=1), periods=periods, freq='W')
         forecast = pd.DataFrame({'ds': idx, 'yhat': last})
 
-    # Build inventory series
+    # Build inventory series and compute WOC
     inv_df = pd.DataFrame({'ds': forecast['ds'], 'on_hand': oh})
-    # Merge all
     result = forecast.merge(inv_df, on='ds')
     result['woc'] = result['on_hand'] / result['yhat']
     if upstream is not None:
         result = result.merge(upstream, on='ds', how='left')
 
-    # Display
+    # Display results
     st.subheader("Forecast Results")
-    st.line_chart(result.set_index('ds')[['yhat','on_hand', 'yhat_up'] if upstream is not None else ['yhat','on_hand']])
+    cols = ['yhat','on_hand'] + (['yhat_up'] if upstream is not None else [])
+    st.line_chart(result.set_index('ds')[cols])
     st.dataframe(result.round(2))
