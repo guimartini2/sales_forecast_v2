@@ -175,12 +175,14 @@ inv_cols = [c for c in df_inv.columns if re.search(r'on hand|sellable', c, re.IG
 if not inv_cols:
     st.error("No inventory 'On Hand' column found.")
     st.stop()
-# Convert the on-hand column to numeric and sum to get total starting inventory
+# Convert the on-hand column to numeric
 on_hand_series = pd.to_numeric(
     df_inv[inv_cols[0]].astype(str).str.replace('[^0-9]', '', regex=True), errors='coerce'
 ).fillna(0).astype(int)
-init_inv = on_hand_series.sum()
+# Use the first snapshot as starting inventory (not sum)
+init_inv = int(on_hand_series.iloc[0])
 # Debug: display initial inventory loaded for verification
+st.write("Initial inventory loaded:", init_inv)
 st.write("Initial inventory loaded:", init_inv)
 
 # Compute dynamic safety stock using coefficient of variation using coefficient of variation
