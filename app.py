@@ -5,6 +5,7 @@ Key improvements:
 - Price input for projected sales
 - Dual-axis chart (units vs. dollars)
 - Recap summary table
+- Overwrite forecast units with Amazon sell-out data
 
 Dependencies (add to requirements.txt):
 
@@ -121,7 +122,9 @@ forecast_label = 'Forecast_Units'
 y_label = 'Units'
 
 # Historical series
-df_hist = pd.DataFrame({'Week_Start': df_raw['Week_Start'], 'y': pd.to_numeric(df_raw[y_col].astype(str).str.replace('[^0-9.]','',regex=True), errors='coerce').fillna(0)})
+df_hist = pd.DataFrame({'Week_Start': df_raw['Week_Start'], 
+                        'y': pd.to_numeric(df_raw[y_col].astype(str)
+                                            .str.replace('[^0-9.]','',regex=True), errors='coerce').fillna(0)})
 df_hist = df_hist[df_hist['Week_Start'] <= pd.to_datetime(datetime.now().date())]
 if df_hist.empty:
     st.error("No valid historical data.")
@@ -129,7 +132,10 @@ if df_hist.empty:
 
 # Forecast dates
 last_date = df_hist['Week_Start'].max()
-start_fc = max(last_date + timedelta(weeks=1), pd.to_datetime(datetime.now().date()) + timedelta(weeks=1))
+start_fc = max(
+    last_date + timedelta(weeks=1),
+    pd.to_datetime(datetime.now().date()) + timedelta(weeks=1)
+)
 future_idx = pd.date_range(start=start_fc, periods=periods, freq='W')
 
 # Generate forecast
@@ -150,38 +156,68 @@ else:
 # Rename forecast column
 df_fc[forecast_label]=df_fc['yhat'].round(0).astype(int)
 
+# Override with Amazon sell-out forecast where available
+if up_path:
+    try:
+        df_up_raw = pd.read_csv(up_path, skiprows=1)
+    except pd.errors.EmptyDataError:
+        st.warning("⚠️ Amazon sell-out forecast file is empty; skipping upstream merge.")
+        df_up_raw = pd.DataFrame()
+    except Exception:
+        df_up_raw = pd.DataFrame()
+
+    if not df_up_raw.empty:
+        rec = []
+        for c in df_up_raw.columns:
+            m = re.search(r"\((\d{1,2} [A-Za-z]+)\)", c)
+            if m:
+                dt = pd.to_datetime(
+                    f"{m.group(1)} {datetime.now().year}",
+                    format="%d %b %Y", errors='coerce'
+                )
+                val = pd.to_numeric(str(df_up_raw[c].iloc[0]).replace(",", ""), errors='coerce')
+                if pd.notna(val):
+                    rec.append({"Week_Start": dt, "Amazon_Sellout_Forecast": int(round(val))})
+        if rec:
+            df_up = pd.DataFrame(rec).sort_values("Week_Start")
+            df_fc = df_fc.merge(df_up, on="Week_Start", how="left")
+            df_fc[forecast_label] = (
+                df_fc["Amazon_Sellout_Forecast"]
+                .fillna(df_fc[forecast_label])
+                .astype(int)
+            )
+
 # Compute projected sales
 df_fc['Projected_Sales'] = (df_fc[forecast_label] * unit_price).round(2)
 
 # Replenishment logic
-on_hand=[]
-replen=[]
-prev=init_inv
-for _,r in df_fc.iterrows():
-    D=r[forecast_label]
-    target=D*woc_target
-    Q=max(target-prev,0)
+on_hand = []
+replen = []
+prev = init_inv
+for _, r in df_fc.iterrows():
+    D = r[forecast_label]
+    target = D * woc_target
+    Q = max(target - prev, 0)
     on_hand.append(int(prev))
     replen.append(int(Q))
-    prev=prev+Q-D
+    prev = prev + Q - D
 
-df_fc['On_Hand_Begin']=on_hand
-df_fc['Replenishment']=replen
-df_fc['Weeks_Of_Cover']=(df_fc['On_Hand_Begin']/df_fc[forecast_label]).replace([np.inf,-np.inf],np.nan).round(2)
+df_fc['On_Hand_Begin'] = on_hand
+df_fc['Replenishment'] = replen
+df_fc['Weeks_Of_Cover'] = (
+    df_fc['On_Hand_Begin'] / df_fc[forecast_label]
+).replace([np.inf, -np.inf], np.nan).round(2)
 
 # Format date
-df_fc['Date']=df_fc['Week_Start'].dt.strftime('%d-%m-%Y')
+df_fc['Date'] = df_fc['Week_Start'].dt.strftime('%d-%m-%Y')
 
 # Plot: dual-axis
 st.subheader(f"{periods}-Week Forecast & Replenishment")
 if PLOTLY_INSTALLED:
-    fig=go.Figure()
-    # Units trace
+    fig = go.Figure()
     fig.add_trace(go.Scatter(x=df_fc['Week_Start'], y=df_fc[forecast_label], name='Forecast Units', yaxis='y1', line=dict(color=AMZ_ORANGE)))
-    # Replenishment
     fig.add_trace(go.Scatter(x=df_fc['Week_Start'], y=df_fc['Replenishment'], name='Replenishment Units', yaxis='y1', line=dict(color=AMZ_BLUE)))
-    # Projected sales on secondary axis
-    fig.add_trace(go.Scatter(x=df_fc['Week_Start'], y=df_fc['Projected_Sales'], name='Projected Sales $', yaxis='y2', line=dict(dash='dot', color='green')))
+    fig.add_trace(go.Scatter(x=df_fc['Week_Start'], y=df_fc['Projected_Sales'], name='Projected Sales $', yaxis='y2', line=dict(dash='dot', color='green')))  
     fig.update_layout(
         xaxis=dict(title='Week'),
         yaxis=dict(title='Units'),
@@ -192,23 +228,23 @@ if PLOTLY_INSTALLED:
     fig.update_xaxes(tickformat='%d-%m-%Y')
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.line_chart(df_fc.set_index('Week_Start')[[forecast_label,'Replenishment']])
+    st.line_chart(df_fc.set_index('Week_Start')[[forecast_label, 'Replenishment']])
     st.line_chart(df_fc.set_index('Week_Start')['Projected_Sales'])
 
 # Recap summary table
 st.subheader("Summary Metrics")
-total_rep=df_fc['Replenishment'].sum()
-total_sales=df_fc['Projected_Sales'].sum()
-avg_sales=df_fc['Projected_Sales'].mean()
-recap=pd.DataFrame({
-    'Metric':['Total Replenishment Units','Total Projected Sales $','Avg Weekly Sales $'],
-    'Value':[f"{total_rep:,}",f"${total_sales:,.2f}",f"${avg_sales:,.2f}"]
+total_rep = df_fc['Replenishment'].sum()
+total_sales = df_fc['Projected_Sales'].sum()
+avg_sales = df_fc['Projected_Sales'].mean()
+recap = pd.DataFrame({
+    'Metric': ['Total Replenishment Units', 'Total Projected Sales $', 'Avg Weekly Sales $'],
+    'Value': [f"{total_rep:,}", f"${total_sales:,.2f}", f"${avg_sales:,.2f}"]
 })
 st.table(recap)
 
 # Detailed table
 st.subheader("Detailed Plan")
-st.dataframe(df_fc[['Date', forecast_label,'Projected_Sales','On_Hand_Begin','Replenishment','Weeks_Of_Cover']], use_container_width=True)
+st.dataframe(df_fc[['Date', forecast_label, 'Projected_Sales', 'On_Hand_Begin', 'Replenishment', 'Weeks_Of_Cover']], use_container_width=True)
 
 # Footer
-st.markdown(f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",unsafe_allow_html=True)
+st.markdown(f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>", unsafe_allow_html=True)
