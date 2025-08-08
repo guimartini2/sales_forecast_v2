@@ -120,14 +120,16 @@ sku = df_raw[sku_col].iloc[0] if sku_col else 'N/A'
 product = df_raw[name_col].iloc[0] if name_col else 'N/A'
 
 # AUTO-DETECT PRODUCT INFO FROM Amazon Sell-Out Forecast FILE
-def sku, product = 'N/A', 'N/A'
+sku, product = 'N/A', 'N/A'
 if upstream_path:
     try:
         df_up_head = pd.read_csv(upstream_path, nrows=1)
-        sku_col = next((c for c in df_up_head.columns if re.search(r'ASIN|SKU', c, re.IGNORECASE)), None)
-        name_col = next((c for c in df_up_head.columns if re.search(r'Name|Title|Product', c, re.IGNORECASE)), None)
-        sku = df_up_head[sku_col].iloc[0] if sku_col and sku_col in df_up_head.columns else 'N/A'
-        product = df_up_head[name_col].iloc[0] if name_col and name_col in df_up_head.columns else 'N/A'
+        sku_col_up = next((c for c in df_up_head.columns if re.search(r'ASIN|SKU', c, re.IGNORECASE)), None)
+        name_col_up = next((c for c in df_up_head.columns if re.search(r'Name|Title|Product', c, re.IGNORECASE)), None)
+        if sku_col_up and sku_col_up in df_up_head.columns:
+            sku = df_up_head[sku_col_up].iloc[0]
+        if name_col_up and name_col_up in df_up_head.columns:
+            product = df_up_head[name_col_up].iloc[0]
     except Exception:
         pass
 # DISPLAY PRODUCT AND SKU
