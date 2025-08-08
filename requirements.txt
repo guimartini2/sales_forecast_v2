@@ -1,7 +1,8 @@
-streamlit
-pandas
-numpy
-# pick at least one forecasting engine (or include all three)
-prophet       # or fbprophet
-statsmodels
-xgboost
+streamlit>=1.0
+pandas>=1.3
+numpy>=1.21
+regex
+prophet>=1.0    # or fbprophet>=0.7
+statsmodels>=0.13
+xgboost>=1.7
+plotly>=5.0
