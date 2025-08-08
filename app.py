@@ -250,20 +250,17 @@ st.subheader(f"{periods}-Week Sell-In Forecast ({projection_type})")
 hist_series = hist[['Week_Start','y']].copy()
 hist_series = hist_series.rename(columns={'y': f'Historical_{forecast_label}'})
 
-# Merge history with result
+# Merge history and future results for chart
+to_merge = [forecast_label, 'Sell_In_Forecast']
+if 'Amazon_Sellout_Forecast' in result.columns:
+    to_merge.insert(1, 'Amazon_Sellout_Forecast')
 chart_df = pd.merge(
-    pd.DataFrame({'Week_Start': future_dates}),
-    result[['Week_Start', forecast_label, 'Sell_In_Forecast'] + (['Amazon_Sellout_Forecast'] if 'Amazon_Sellout_Forecast' in result.columns else [])],
-    on='Week_Start', how='right'
-)
-chart_df = pd.merge(chart_df, hist_series, on='Week_Start', how='outer')
-chart_df = chart_df.sort_values('Week_Start')
+    hist_series,
+    result[['Week_Start'] + to_merge],
+    on='Week_Start', how='outer'
+).sort_values('Week_Start')
 
-# Define metrics order: history, upstream, forecast, sell-in
-metrics = [f'Historical_{forecast_label}']
-if 'Amazon_Sellout_Forecast' in chart_df.columns:
-    metrics.append('Amazon_Sellout_Forecast')
-metrics += [forecast_label, 'Sell_In_Forecast']
+metrics = [f'Historical_{forecast_label}'] + to_merge
 
 if PLOTLY_INSTALLED:
     fig = px.line(
