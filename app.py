@@ -11,6 +11,7 @@ What this fixes/does:
 
 import os
 import re
+from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -91,12 +92,12 @@ if not sales_path:
     st.stop()
 
 # ------------------------ Helpers ------------------------
-def _maybe_seek_start(obj):
+def _maybe_seek_start(obj) -> None:
     if hasattr(obj, "seek"):
         try: obj.seek(0)
         except Exception: pass
 
-def try_parse_date_string(s: str, prefer_year: int | None = None) -> pd.Timestamp | pd.NaT:
+def try_parse_date_string(s: str, prefer_year: Optional[int] = None) -> Optional[pd.Timestamp]:
     """Parse a single date string under many formats. If year missing, attach prefer_year."""
     s = str(s).strip()
     if prefer_year and re.search(r"\b\d{4}\b", s) is None and re.search(r"\b\d{2}\b", s) is None:
@@ -107,96 +108,92 @@ def try_parse_date_string(s: str, prefer_year: int | None = None) -> pd.Timestam
     # Try structured formats first
     for fmt in ("%d %b %Y", "%d %B %Y", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d-%m-%Y"):
         dt = pd.to_datetime(s_forced, format=fmt, errors="coerce")
-        if pd.notna(dt): return dt
+        if pd.notna(dt):
+            return pd.to_datetime(dt)
 
     # Fallback: let pandas guess
     dt = pd.to_datetime(s_forced, errors="coerce")
-    return dt
+    if pd.notna(dt):
+        return pd.to_datetime(dt)
+    return None
 
-def extract_weekstart_from_header(col: str, prefer_year: int | None = None) -> pd.Timestamp | pd.NaT:
+def extract_weekstart_from_header(col: str, prefer_year: Optional[int] = None) -> Optional[pd.Timestamp]:
     """
-    From headers like:
+    Accepts headers like:
       - "Week 38 (26 Apr - 2 May)"
       - "Week 0 (3 Aug - 9 Aug)"
       - "1/6/25 - 1/12/25"
       - "Week of 2025-01-06"
-    Return the first date (start of week). Normalize to W-MON boundary at the end.
+    Returns Monday week-start (W-MON) or None.
     """
     s = str(col)
 
-    # Case A: text inside parentheses "( ... )"
+    # pull inside parentheses if present
     m = re.search(r"\(([^)]*)\)", s)
     candidate = m.group(1) if m else s
 
-    # Try to split a range "start - end" and take the first token
+    # Prefer "Week of X"
+    wk = re.search(r"Week of\s*(.*)$", s, flags=re.I)
+    if wk:
+        candidate = wk.group(1).strip()
+
+    # Split ranges "start - end" and take first token
     parts = re.split(r"\s*-\s*", candidate.strip())
     first_part = parts[0] if parts else candidate.strip()
 
-    # Heuristics for "Week of DATE"
-    wk = re.search(r"Week of\s*(.*)$", s, flags=re.I)
-    if wk: first_part = wk.group(1).strip()
-
-    # If still something like "Week 42 24 May", strip leading "Week \d+"
+    # Strip leading 'Week N' noise if it leaked into first_part
     first_part = re.sub(r"^Week\s*\d+\s*", "", first_part, flags=re.I).strip()
 
     dt = try_parse_date_string(first_part, prefer_year=prefer_year)
-    if pd.isna(dt):
-        # Try to pull the first explicit date pattern
+    if dt is None:
+        # Try to pull an explicit numeric date
         m2 = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", candidate)
         if m2:
             dt = try_parse_date_string(m2.group(1), prefer_year=prefer_year)
         else:
-            # Try textual "3 Aug" form
+            # Try textual "3 Aug"
             m3 = re.search(r"\b(\d{1,2}\s+[A-Za-z]{3,9})\b", candidate)
             if m3:
                 dt = try_parse_date_string(m3.group(1), prefer_year=prefer_year)
 
-    if pd.isna(dt): 
-        return pd.NaT
+    if dt is None:
+        return None
 
-    # Normalize to Monday start
-    dt = pd.to_datetime(dt).to_period("W-MON").start_time
-    return dt
+    # Normalize to Monday week start
+    return pd.to_datetime(dt).to_period("W-MON").dt.start_time.iloc[0] if isinstance(dt, pd.Series) else pd.to_datetime(dt).to_period("W-MON").start_time
 
-def read_wide_sales_to_long(src):
+def read_wide_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Reads a wide Sales CSV where week columns contain sales/units.
-    Strategy:
-      - Read with basic pandas (comma sep). If fails, attempt a few seps.
-      - Detect week columns by attempting date extraction from headers.
-      - Melt to long: Week_Start, y
-      - If multiple SKU rows exist, sums per week.
+    - Detect week columns from headers
+    - Melt to long and sum across rows if multiple SKUs
     """
-    tried = False
     df = None
     for sep in (",", ";", "\t", "|"):
         try:
             _maybe_seek_start(src)
             tmp = pd.read_csv(src, sep=sep, engine="python")
             if tmp.shape[1] > 1:
-                df = tmp; break
+                df = tmp; used_sep = sep; break
         except Exception:
             continue
     if df is None:
         st.error("Could not read Sales CSV.")
         st.stop()
 
-    # Prefer year: try deducing from any "Report Updated=[...]" or from today's year
     prefer_year = datetime.now().year
     for c in df.columns:
         m = re.search(r"Report Updated=\[([^\]]+)\]", str(c))
         if m:
             parsed = try_parse_date_string(m.group(1))
-            if pd.notna(parsed):
+            if parsed is not None:
                 prefer_year = parsed.year
                 break
 
-    # Identify week columns
-    week_cols = []
-    week_map = {}
+    week_cols, week_map = [], {}
     for c in df.columns:
         wk = extract_weekstart_from_header(c, prefer_year)
-        if pd.notna(wk):
+        if wk is not None:
             week_cols.append(c)
             week_map[c] = wk
 
@@ -209,17 +206,16 @@ def read_wide_sales_to_long(src):
     long["Week_Start"] = long["col"].map(week_map)
     long.dropna(subset=["Week_Start"], inplace=True)
 
-    # Clean numeric
     long["y"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce").fillna(0)
-
-    # Aggregate by week (sum over rows/SKUs if present)
     out = long.groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
-    return out, {"week_cols_found": len(week_cols), "prefer_year": prefer_year, "rows_raw": len(df), "rows_long": len(long)}
 
-def read_wide_amazon_forecast_to_long(src):
+    meta = {"week_cols_found": len(week_cols), "prefer_year": prefer_year, "rows_raw": len(df), "rows_long": len(long), "sep_used": used_sep}
+    return out, meta
+
+def read_wide_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Reads wide Amazon Forecast CSV (e.g., columns like "Week 38 (26 Apr - 2 May)").
-    Returns DataFrame Week_Start, Amazon_Sellout_Forecast.
+    Reads wide Amazon Forecast CSV (e.g., "Week 38 (26 Apr - 2 May)" columns).
+    Returns Week_Start, Amazon_Sellout_Forecast (summed across rows if multiple SKUs).
     """
     df = None
     for sep in (",", ";", "\t", "|"):
@@ -227,7 +223,7 @@ def read_wide_amazon_forecast_to_long(src):
             _maybe_seek_start(src)
             tmp = pd.read_csv(src, sep=sep, engine="python")
             if tmp.shape[1] > 1:
-                df = tmp; break
+                df = tmp; used_sep = sep; break
         except Exception:
             continue
     if df is None or df.empty:
@@ -238,34 +234,39 @@ def read_wide_amazon_forecast_to_long(src):
         m = re.search(r"Report Updated=\[([^\]]+)\]", str(c))
         if m:
             parsed = try_parse_date_string(m.group(1))
-            if pd.notna(parsed):
+            if parsed is not None:
                 prefer_year = parsed.year
                 break
 
-    # Detect week columns
-    week_cols = []
-    week_map = {}
+    week_cols, week_map = [], {}
     for c in df.columns:
         wk = extract_weekstart_from_header(c, prefer_year)
-        if pd.notna(wk):
+        if wk is not None:
             week_cols.append(c)
             week_map[c] = wk
 
     if not week_cols:
         return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"week_cols_found": 0}
 
-    # Use first data row (single ASIN) by default; if many rows, we can sum
     id_cols = [c for c in df.columns if c not in week_cols]
     long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
     long["Week_Start"] = long["col"].map(week_map)
     long.dropna(subset=["Week_Start"], inplace=True)
     long["nval"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
 
-    # Sum across SKUs if present
     df_up = long.groupby("Week_Start", as_index=False)["nval"].sum().rename(columns={"nval": "Amazon_Sellout_Forecast"})
     df_up["Amazon_Sellout_Forecast"] = df_up["Amazon_Sellout_Forecast"].round().astype(int)
     df_up = df_up.sort_values("Week_Start")
-    return df_up, {"week_cols_found": len(week_cols), "prefer_year": prefer_year, "rows_raw": len(df), "rows_long": len(long)}
+
+    meta = {"week_cols_found": len(week_cols), "prefer_year": prefer_year, "rows_raw": len(df), "rows_long": len(long), "sep_used": used_sep}
+    return df_up, meta
+
+def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
+    start_date = pd.to_datetime(start_date)
+    next_mon = (start_date + pd.offsets.Week(weekday=0))
+    if next_mon <= start_date:
+        next_mon = next_mon + pd.offsets.Week(weekday=0)
+    return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
 
 # ------------------------ Load & reshape ------------------------
 df_hist, sales_meta = read_wide_sales_to_long(sales_path)
@@ -286,15 +287,6 @@ if df_hist.empty:
 # ------------------------ Forecast ------------------------
 forecast_label = "Forecast_Units"
 last_week = df_hist["Week_Start"].max() if not df_hist.empty else today
-
-def future_weeks_after(start_date, periods):
-    start_date = pd.to_datetime(start_date)
-    # Next Monday strictly after start_date
-    next_mon = (start_date + pd.offsets.Week(weekday=0))
-    if next_mon <= start_date:
-        next_mon = next_mon + pd.offsets.Week(weekday=0)
-    return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
-
 future_idx = future_weeks_after(max(last_week, today), periods)
 
 if model_choice == "Prophet" and PROPHET_INSTALLED and not df_hist.empty and df_hist["y"].sum() > 0:
