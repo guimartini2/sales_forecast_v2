@@ -89,7 +89,7 @@ if not sales_path:
     st.error("Sales history file is required.")
     st.stop()
 
-# ------------------------ Helpers (unchanged) ------------------------
+# ------------------------ Helpers ------------------------
 def _maybe_seek_start(obj) -> None:
     if hasattr(obj, "seek"):
         try: obj.seek(0)
@@ -140,22 +140,14 @@ def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
         next_mon = next_mon + pd.offsets.Week(weekday=0)
     return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
 
-# ------------------------ SALES LOADER (modified) ------------------------
+# ------------------------ SALES LOADER (Amazon "View By = Week") ------------------------
 def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Handle Amazon Retail 'View By = Week' export:
-      Row 0: metadata line
-      Row 1: header with 'Week', 'Ordered Units', 'Shipped Units', etc.
-      Rows: "YYYY-MM-DD - YYYY-MM-DD", values like "3,751"
-    """
-    # Try common skiprows to expose the real header (we know 1 works on your file)
     for skip in (1, 0, 2, 3, 4):
         try:
             _maybe_seek_start(src)
             df = pd.read_csv(src, sep=None, engine="python", skiprows=skip)
             if "Week" not in df.columns:
                 continue
-            # Prefer Shipped Units, else Ordered Units, else any *Units*
             units_col = None
             for cand in ["Shipped Units", "Ordered Units"]:
                 if cand in df.columns:
@@ -167,7 +159,6 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             if units_col is None:
                 continue
 
-            # Parse start of week from "YYYY-MM-DD - YYYY-MM-DD"
             week_start = pd.to_datetime(df["Week"].astype(str).str.split(" - ").str[0], errors="coerce")
             vals = pd.to_numeric(df[units_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce").fillna(0)
             out = pd.DataFrame({"Week_Start": week_start.dt.to_period("W-MON").dt.start_time, "y": vals})
@@ -177,7 +168,7 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         except Exception:
             continue
 
-    # Fallback (rare): treat as wide with week columns (kept from previous version)
+    # Fallback: handle rare "wide" sales format
     _maybe_seek_start(src)
     df = pd.read_csv(src, sep=None, engine="python")
     prefer_year = datetime.now().year
@@ -199,12 +190,8 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum())}
     return out, meta
 
-# ------------------------ AMAZON FORECAST LOADER (modified) ------------------------
+# ------------------------ AMAZON FORECAST LOADER (scan skiprows) ------------------------
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Find the header row with 'Week N (dd Mon - dd Mon)' columns by scanning skiprows.
-    Melt to long and sum across rows (if multiple ASINs).
-    """
     prefer_year = datetime.now().year
     for skip in range(0, 6):
         try:
@@ -242,7 +229,7 @@ with st.expander("Debug: parsing summary"):
     st.json({"sales_meta": sales_meta, "amazon_forecast_meta": up_meta,
              "hist_rows": int(len(df_hist)), "hist_sum": float(df_hist["y"].sum())})
 
-# ------------------------ Forecast (unchanged) ------------------------
+# ------------------------ Forecast ------------------------
 forecast_label = "Forecast_Units"
 last_week = df_hist["Week_Start"].max() if not df_hist.empty else today
 future_idx = future_weeks_after(max(last_week, today), periods)
@@ -268,14 +255,13 @@ else:
 
 df_fc[forecast_label] = pd.Series(df_fc["yhat"]).clip(lower=0).round().astype(int)
 
-# ------------------------ Override with Amazon forecast (outer merge; unchanged logic) ------------------------
+# ------------------------ Override with Amazon forecast (outer merge) ------------------------
 if not df_up.empty:
     merged = pd.merge(df_fc[["Week_Start", forecast_label]], df_up, on="Week_Start", how="outer")
     merged = merged.sort_values("Week_Start").reset_index(drop=True)
     merged[forecast_label] = merged["Amazon_Sellout_Forecast"].fillna(merged[forecast_label]).fillna(0).astype(int)
     start_from = future_weeks_after(max(last_week, today), 1)[0]
     horizon = pd.date_range(start=start_from, periods=periods, freq="W-MON")
-    # Align all to Monday, then reindex to horizon
     merged["Week_Start"] = pd.to_datetime(merged["Week_Start"]).to_period("W-MON").dt.start_time
     merged = merged.groupby("Week_Start", as_index=False)[forecast_label].sum()
     merged = merged.set_index("Week_Start").reindex(horizon, fill_value=0).reset_index().rename(columns={"index": "Week_Start"})
@@ -283,7 +269,7 @@ if not df_up.empty:
 else:
     st.warning("⚠️ Amazon sell-out forecast file parsed with 0 week columns or was missing; not overriding.")
 
-# ------------------------ Projected $ + Replenishment (unchanged) ------------------------
+# ------------------------ Projected $ + Replenishment ------------------------
 df_fc["Projected_Sales"] = (df_fc[forecast_label] * float(unit_price)).round(2)
 
 hist_window = max(8, min(12, len(df_hist))) if not df_hist.empty else 0
@@ -293,4 +279,74 @@ target_inventory = avg_weekly_demand * float(woc_target)
 
 on_hand_begin, replenishments = [], []
 prev = int(init_inv)
-for _, r in df_fc.ite
+for _, r in df_fc.iterrows():
+    demand = int(r[forecast_label])
+    order_qty = max(int(round(target_inventory - prev)), 0)
+    on_hand_begin.append(int(prev))
+    replenishments.append(order_qty)
+    prev = max(prev + order_qty - demand, 0)
+
+df_fc["On_Hand_Begin"] = on_hand_begin
+df_fc["Replenishment"] = replenishments
+df_fc["Weeks_Of_Cover"] = np.where(
+    df_fc[forecast_label] > 0,
+    (df_fc["On_Hand_Begin"] / df_fc[forecast_label]).round(2),
+    np.nan
+)
+df_fc["Date"] = pd.to_datetime(df_fc["Week_Start"]).dt.strftime("%d-%m-%Y")
+
+# ------------------------ Plot ------------------------
+st.subheader(f"{periods}-Week Forecast & Replenishment")
+if projection_type == "Sales $":
+    primary_key, primary_title = "Projected_Sales", "Sales $"
+    secondary_key, secondary_title = forecast_label, "Units"
+else:
+    primary_key, primary_title = forecast_label, "Units"
+    secondary_key, secondary_title = "Projected_Sales", "Sales $"
+
+if PLOTLY_INSTALLED:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_fc["Week_Start"], y=df_fc[primary_key],
+                             name=f"{primary_title} ({'Projected' if primary_key=='Projected_Sales' else 'Forecast'})",
+                             yaxis="y", line=dict(color=AMZ_ORANGE)))
+    fig.add_trace(go.Scatter(x=df_fc["Week_Start"], y=df_fc["Replenishment"],
+                             name="Replenishment Units",
+                             yaxis="y" if primary_key == forecast_label else "y2",
+                             line=dict(color=AMZ_BLUE)))
+    if secondary_key != primary_key:
+        fig.add_trace(go.Scatter(x=df_fc["Week_Start"], y=df_fc[secondary_key],
+                                 name=f"{secondary_title} ({'Projected' if secondary_key=='Projected_Sales' else 'Forecast'})",
+                                 yaxis="y2", line=dict(dash="dot")))
+    fig.update_layout(
+        xaxis=dict(title="Week"),
+        yaxis=dict(title=primary_title),
+        yaxis2=dict(title=secondary_title, overlaying="y", side="right"),
+        legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center"),
+        hovermode="x unified",
+        margin=dict(l=40, r=40, t=40, b=40),
+    )
+    fig.update_xaxes(tickformat="%d-%m-%Y")
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.line_chart(df_fc.set_index("Week_Start")[[forecast_label, "Replenishment"]])
+    st.line_chart(df_fc.set_index("Week_Start")["Projected_Sales"])
+
+# ------------------------ Summary + Detail ------------------------
+st.subheader("Summary Metrics")
+total_rep = int(df_fc["Replenishment"].sum())
+total_sales = float(df_fc["Projected_Sales"].sum())
+avg_sales = float(df_fc["Projected_Sales"].mean())
+recap = pd.DataFrame({
+    "Metric": ["Total Replenishment Units", "Total Projected Sales $", "Avg Weekly Sales $"],
+    "Value": [f"{total_rep:,}", f"${total_sales:,.2f}", f"${avg_sales:,.2f}"]
+})
+st.table(recap)
+
+st.subheader("Detailed Plan")
+st.dataframe(df_fc[["Date", forecast_label, "Projected_Sales", "On_Hand_Begin", "Replenishment", "Weeks_Of_Cover"]],
+             use_container_width=True)
+
+st.markdown(
+    f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",
+    unsafe_allow_html=True,
+)
