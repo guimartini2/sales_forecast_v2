@@ -1,12 +1,9 @@
 """
 Amazon Replenishment Forecast — Wide CSV Compatible
-
-What this fixes/does:
-- Handles *wide* Sales CSV (weeks as columns) by melting to tidy long form
-- Handles *wide* Amazon Forecast CSV (weeks as columns like "Week 38 (26 Apr - 2 May)") by melting
-- Robust date extraction from column headers (supports "3 Aug", "03 Aug", "03 August", "8/3/25", etc.)
-- Aligns to Monday week-start (W-MON)
-- Keeps prior improvements (Plotly dual axis, Projection Type, WOC policy)
+(Only minimal changes from your last version)
+- Use sep=None (csv sniffer) before trying fixed separators for BOTH wide readers
+- When overriding with Amazon forecast, use an OUTER merge and rebuild the horizon from the union of dates
+- If filtering history to <= today would empty it, keep the unfiltered history
 """
 
 import os
@@ -81,7 +78,7 @@ if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to generate the forecast and replenishment plan.")
     st.stop()
 
-# Defaults (your uploaded file paths from the session)
+# Defaults
 default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2025_8-6-2025.csv"
 default_up    = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 sales_path = sales_file if sales_file is not None else (default_sales if os.path.exists(default_sales) else None)
@@ -98,85 +95,62 @@ def _maybe_seek_start(obj) -> None:
         except Exception: pass
 
 def try_parse_date_string(s: str, prefer_year: Optional[int] = None) -> Optional[pd.Timestamp]:
-    """Parse a single date string under many formats. If year missing, attach prefer_year."""
     s = str(s).strip()
     if prefer_year and re.search(r"\b\d{4}\b", s) is None and re.search(r"\b\d{2}\b", s) is None:
         s_forced = f"{s} {prefer_year}"
     else:
         s_forced = s
-
-    # Try structured formats first
     for fmt in ("%d %b %Y", "%d %B %Y", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d-%m-%Y"):
         dt = pd.to_datetime(s_forced, format=fmt, errors="coerce")
         if pd.notna(dt):
             return pd.to_datetime(dt)
-
-    # Fallback: let pandas guess
     dt = pd.to_datetime(s_forced, errors="coerce")
     if pd.notna(dt):
         return pd.to_datetime(dt)
     return None
 
 def extract_weekstart_from_header(col: str, prefer_year: Optional[int] = None) -> Optional[pd.Timestamp]:
-    """
-    Accepts headers like:
-      - "Week 38 (26 Apr - 2 May)"
-      - "Week 0 (3 Aug - 9 Aug)"
-      - "1/6/25 - 1/12/25"
-      - "Week of 2025-01-06"
-    Returns Monday week-start (W-MON) or None.
-    """
     s = str(col)
-
-    # pull inside parentheses if present
     m = re.search(r"\(([^)]*)\)", s)
     candidate = m.group(1) if m else s
-
-    # Prefer "Week of X"
     wk = re.search(r"Week of\s*(.*)$", s, flags=re.I)
     if wk:
         candidate = wk.group(1).strip()
-
-    # Split ranges "start - end" and take first token
     parts = re.split(r"\s*-\s*", candidate.strip())
     first_part = parts[0] if parts else candidate.strip()
-
-    # Strip leading 'Week N' noise if it leaked into first_part
     first_part = re.sub(r"^Week\s*\d+\s*", "", first_part, flags=re.I).strip()
-
     dt = try_parse_date_string(first_part, prefer_year=prefer_year)
     if dt is None:
-        # Try to pull an explicit numeric date
         m2 = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", candidate)
         if m2:
             dt = try_parse_date_string(m2.group(1), prefer_year=prefer_year)
         else:
-            # Try textual "3 Aug"
             m3 = re.search(r"\b(\d{1,2}\s+[A-Za-z]{3,9})\b", candidate)
             if m3:
                 dt = try_parse_date_string(m3.group(1), prefer_year=prefer_year)
-
     if dt is None:
         return None
-
-    # Normalize to Monday week start
-    return pd.to_datetime(dt).to_period("W-MON").dt.start_time.iloc[0] if isinstance(dt, pd.Series) else pd.to_datetime(dt).to_period("W-MON").start_time
+    return pd.to_datetime(dt).to_period("W-MON").start_time
 
 def read_wide_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Reads a wide Sales CSV where week columns contain sales/units.
-    - Detect week columns from headers
-    - Melt to long and sum across rows if multiple SKUs
-    """
+    """Wide Sales CSV -> long weekly totals"""
     df = None
-    for sep in (",", ";", "\t", "|"):
-        try:
-            _maybe_seek_start(src)
-            tmp = pd.read_csv(src, sep=sep, engine="python")
-            if tmp.shape[1] > 1:
-                df = tmp; used_sep = sep; break
-        except Exception:
-            continue
+    # NEW: try pandas sniffer first
+    try:
+        _maybe_seek_start(src)
+        df = pd.read_csv(src, sep=None, engine="python")
+        used_sep = "sniffed"
+    except Exception:
+        pass
+    if df is None or df.shape[1] <= 1:
+        for sep in (",", ";", "\t", "|"):
+            try:
+                _maybe_seek_start(src)
+                tmp = pd.read_csv(src, sep=sep, engine="python")
+                if tmp.shape[1] > 1:
+                    df = tmp; used_sep = sep; break
+            except Exception:
+                continue
     if df is None:
         st.error("Could not read Sales CSV.")
         st.stop()
@@ -196,7 +170,6 @@ def read_wide_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         if wk is not None:
             week_cols.append(c)
             week_map[c] = wk
-
     if not week_cols:
         st.error("Sales CSV: no week columns recognized from headers.")
         st.stop()
@@ -205,27 +178,30 @@ def read_wide_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
     long["Week_Start"] = long["col"].map(week_map)
     long.dropna(subset=["Week_Start"], inplace=True)
-
     long["y"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce").fillna(0)
     out = long.groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
-
     meta = {"week_cols_found": len(week_cols), "prefer_year": prefer_year, "rows_raw": len(df), "rows_long": len(long), "sep_used": used_sep}
     return out, meta
 
 def read_wide_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Reads wide Amazon Forecast CSV (e.g., "Week 38 (26 Apr - 2 May)" columns).
-    Returns Week_Start, Amazon_Sellout_Forecast (summed across rows if multiple SKUs).
-    """
+    """Wide Amazon Forecast CSV -> long weekly totals"""
     df = None
-    for sep in (",", ";", "\t", "|"):
-        try:
-            _maybe_seek_start(src)
-            tmp = pd.read_csv(src, sep=sep, engine="python")
-            if tmp.shape[1] > 1:
-                df = tmp; used_sep = sep; break
-        except Exception:
-            continue
+    # NEW: sniffer first
+    try:
+        _maybe_seek_start(src)
+        df = pd.read_csv(src, sep=None, engine="python")
+        used_sep = "sniffed"
+    except Exception:
+        pass
+    if df is None or df.shape[1] <= 1:
+        for sep in (",", ";", "\t", "|"):
+            try:
+                _maybe_seek_start(src)
+                tmp = pd.read_csv(src, sep=sep, engine="python")
+                if tmp.shape[1] > 1:
+                    df = tmp; used_sep = sep; break
+            except Exception:
+                continue
     if df is None or df.empty:
         return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"week_cols_found": 0}
 
@@ -244,7 +220,6 @@ def read_wide_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]
         if wk is not None:
             week_cols.append(c)
             week_map[c] = wk
-
     if not week_cols:
         return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"week_cols_found": 0}
 
@@ -253,11 +228,9 @@ def read_wide_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]
     long["Week_Start"] = long["col"].map(week_map)
     long.dropna(subset=["Week_Start"], inplace=True)
     long["nval"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
-
     df_up = long.groupby("Week_Start", as_index=False)["nval"].sum().rename(columns={"nval": "Amazon_Sellout_Forecast"})
     df_up["Amazon_Sellout_Forecast"] = df_up["Amazon_Sellout_Forecast"].round().astype(int)
     df_up = df_up.sort_values("Week_Start")
-
     meta = {"week_cols_found": len(week_cols), "prefer_year": prefer_year, "rows_raw": len(df), "rows_long": len(long), "sep_used": used_sep}
     return df_up, meta
 
@@ -271,7 +244,9 @@ def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
 # ------------------------ Load & reshape ------------------------
 df_hist, sales_meta = read_wide_sales_to_long(sales_path)
 today = pd.to_datetime(datetime.now().date())
-df_hist = df_hist[df_hist["Week_Start"] <= today]
+df_hist_filtered = df_hist[df_hist["Week_Start"] <= today]
+# NEW: if filtering empties the data, keep unfiltered (don’t zero out)
+df_hist = df_hist_filtered if not df_hist_filtered.empty else df_hist
 
 df_up = pd.DataFrame()
 up_meta = {"week_cols_found": 0}
@@ -279,10 +254,8 @@ if up_path:
     df_up, up_meta = read_wide_amazon_forecast_to_long(up_path)
 
 with st.expander("Debug: parsing summary"):
-    st.json({"sales_meta": sales_meta, "amazon_forecast_meta": up_meta})
-
-if df_hist.empty:
-    st.warning("Historical data empty after filtering to today. Proceeding with zero baseline.")
+    st.json({"sales_meta": sales_meta, "amazon_forecast_meta": up_meta,
+             "hist_rows": int(len(df_hist)), "hist_sum": float(df_hist["y"].sum())})
 
 # ------------------------ Forecast ------------------------
 forecast_label = "Forecast_Units"
@@ -310,10 +283,25 @@ else:
 
 df_fc[forecast_label] = pd.Series(df_fc["yhat"]).clip(lower=0).round().astype(int)
 
-# ------------------------ Override with Amazon forecast (if provided) ------------------------
+# ------------------------ Override with Amazon forecast (outer merge) ------------------------
 if not df_up.empty:
-    df_fc = df_fc.merge(df_up, on="Week_Start", how="left")
-    df_fc[forecast_label] = df_fc["Amazon_Sellout_Forecast"].fillna(df_fc[forecast_label]).astype(int)
+    # NEW: outer merge and rebuild horizon from the union
+    merged = pd.merge(df_fc[["Week_Start", forecast_label]], df_up, on="Week_Start", how="outer")
+    merged = merged.sort_values("Week_Start").reset_index(drop=True)
+    # Decide forecast value: Amazon where present, else model
+    merged[forecast_label] = merged["Amazon_Sellout_Forecast"].fillna(merged[forecast_label]).fillna(0).astype(int)
+
+    # Re-limit to the next `periods` weeks from the first future Monday
+    start_from = future_weeks_after(max(last_week, today), 1)[0]
+    horizon = pd.date_range(start=start_from, periods=periods, freq="W-MON")
+    merged = merged[merged["Week_Start"].isin(horizon)]
+    # If Amazon provided weeks don’t exactly match Mondays, align to Monday
+    if len(merged) < periods:
+        # align all to W-MON then reindex to horizon
+        merged["Week_Start"] = pd.to_datetime(merged["Week_Start"]).to_period("W-MON").start_time
+        merged = merged.groupby("Week_Start", as_index=False)[forecast_label].sum()
+        merged = merged.set_index("Week_Start").reindex(horizon, fill_value=0).reset_index().rename(columns={"index":"Week_Start"})
+    df_fc = merged.copy()
 else:
     st.warning("⚠️ Amazon sell-out forecast file parsed with 0 week columns or was missing; not overriding.")
 
