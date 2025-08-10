@@ -1,10 +1,12 @@
 """
-Amazon Replenishment Forecast — Wide/Long CSV Compatible
-(Only targeted fixes)
-- Sales loader: detect "long" table with 'Week' column and parse Shipped/Ordered Units
-- Amazon loader: search skiprows to find week columns (e.g., "Week 0 (3 Aug - 9 Aug)")
-- Both loaders produce Week_Start and numeric values; alignment to W-MON
-- Override uses outer merge on union of weeks
+Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
+Targeted changes only:
+- NEW: Optional Inventory CSV loader (Week + On Hand Units)
+- NEW: Lead time (weeks) control
+- NEW: Order-Up-To policy that predicts weekly PO units with delivery after lead time
+- Renames replenishment outputs to Predicted_PO_Units and Predicted_SellIn_$
+
+Everything else (file parsing, charts, Prophet/ARIMA, Amazon forecast override, UI) is unchanged.
 """
 
 import os
@@ -60,9 +62,11 @@ st.markdown(
 st.sidebar.header("Data Inputs & Settings")
 sales_file = st.sidebar.file_uploader("Sales history CSV (Amazon export)", type=["csv"])
 fcst_file = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV (wide)", type=["csv"])
+# NEW: Inventory CSV upload (weekly On Hand)
+inv_file  = st.sidebar.file_uploader("Amazon Inventory CSV (optional, weekly On Hand)", type=["csv"])
 
 projection_type = st.sidebar.selectbox("Projection Type (primary Y-axis)", ["Units", "Sales $"])
-init_inv = st.sidebar.number_input("Current On-Hand Inventory (units)", min_value=0, value=26730, step=1)
+init_inv = st.sidebar.number_input("Fallback Current On-Hand Inventory (units)", min_value=0, value=26730, step=1)
 unit_price = st.sidebar.number_input("Unit Price ($)", min_value=0.0, value=10.0, step=0.01)
 
 model_opts = []
@@ -73,10 +77,12 @@ model_choice = st.sidebar.selectbox("Forecast Model", model_opts)
 
 woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
 periods = int(st.sidebar.number_input("Forecast Horizon (weeks)", min_value=4, max_value=52, value=12))
+# NEW: lead time
+lead_time_weeks = int(st.sidebar.number_input("Lead Time (weeks) — PO arrival delay", min_value=0, max_value=26, value=2))
 
 st.markdown("---")
 if not st.button("Run Forecast"):
-    st.info("Click 'Run Forecast' to generate the forecast and replenishment plan.")
+    st.info("Click 'Run Forecast' to generate the forecast and predicted POs.")
     st.stop()
 
 # Defaults (paths from your session)
@@ -84,6 +90,7 @@ default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1
 default_up    = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 sales_path = sales_file if sales_file is not None else (default_sales if os.path.exists(default_sales) else None)
 up_path    = fcst_file  if fcst_file  is not None else (default_up    if os.path.exists(default_up)    else None)
+inv_path   = inv_file   if inv_file   is not None else None  # optional
 
 if not sales_path:
     st.error("Sales history file is required.")
@@ -214,6 +221,42 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             continue
     return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"skip": None, "week_cols_found": 0, "rows": 0}
 
+# ------------------------ INVENTORY LOADER (NEW, optional) ------------------------
+def read_inventory_onhand(src) -> Optional[int]:
+    """
+    Accepts an inventory CSV with a 'Week' column and an 'On Hand' (units) column.
+    Returns the latest on-hand value (most recent week <= today), or None if not found.
+    """
+    today = pd.to_datetime(datetime.now().date())
+    for skip in (0, 1, 2, 3, 4, 5):
+        try:
+            _maybe_seek_start(src)
+            df = pd.read_csv(src, sep=None, engine="python", skiprows=skip)
+            # find week and on-hand columns
+            week_col = None
+            for c in df.columns:
+                if str(c).strip().lower() == "week" or re.search(r"\bweek\b", str(c), re.I):
+                    week_col = c; break
+            if week_col is None:
+                continue
+            onhand_col = None
+            for c in df.columns:
+                if re.search(r"on\s*hand|onhand|o/h|inventory", str(c), re.I):
+                    onhand_col = c; break
+            if onhand_col is None:
+                continue
+            wk = pd.to_datetime(df[week_col].astype(str).str.split(" - ").str[0], errors="coerce")
+            oh = pd.to_numeric(df[onhand_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+            tmp = pd.DataFrame({"Week_Start": wk.dt.to_period("W-MON").dt.start_time, "OH": oh})
+            tmp = tmp.dropna(subset=["Week_Start", "OH"])
+            tmp = tmp[tmp["Week_Start"] <= today].sort_values("Week_Start")
+            if tmp.empty: 
+                continue
+            return int(tmp["OH"].iloc[-1])
+        except Exception:
+            continue
+    return None  # will fall back to sidebar init_inv
+
 # ------------------------ Load & reshape ------------------------
 df_hist, sales_meta = read_sales_to_long(sales_path)
 today = pd.to_datetime(datetime.now().date())
@@ -225,9 +268,20 @@ up_meta = {"week_cols_found": 0}
 if up_path:
     df_up, up_meta = read_amazon_forecast_to_long(up_path)
 
+# NEW: get starting on-hand from inventory CSV if available
+init_inv_override = None
+if inv_path:
+    init_inv_override = read_inventory_onhand(inv_path)
+start_on_hand = int(init_inv_override) if init_inv_override is not None else int(init_inv)
+
 with st.expander("Debug: parsing summary"):
-    st.json({"sales_meta": sales_meta, "amazon_forecast_meta": up_meta,
-             "hist_rows": int(len(df_hist)), "hist_sum": float(df_hist["y"].sum())})
+    st.json({
+        "sales_meta": sales_meta,
+        "amazon_forecast_meta": up_meta,
+        "start_on_hand_used": start_on_hand,
+        "hist_rows": int(len(df_hist)),
+        "hist_sum": float(df_hist["y"].sum())
+    })
 
 # ------------------------ Forecast ------------------------
 forecast_label = "Forecast_Units"
@@ -255,7 +309,7 @@ else:
 
 df_fc[forecast_label] = pd.Series(df_fc["yhat"]).clip(lower=0).round().astype(int)
 
-# ------------------------ Override with Amazon forecast (outer merge) ------------------------
+# Override with Amazon sell-out forecast (outer merge + alignment)
 if not df_up.empty:
     merged = pd.merge(df_fc[["Week_Start", forecast_label]], df_up, on="Week_Start", how="outer")
     merged = merged.sort_values("Week_Start").reset_index(drop=True)
@@ -269,25 +323,56 @@ if not df_up.empty:
 else:
     st.warning("⚠️ Amazon sell-out forecast file parsed with 0 week columns or was missing; not overriding.")
 
-# ------------------------ Projected $ + Replenishment ------------------------
+# ------------------------ Projected $ ------------------------
 df_fc["Projected_Sales"] = (df_fc[forecast_label] * float(unit_price)).round(2)
 
+# ------------------------ Predict Weekly POs (NEW) ------------------------
+# Demand rate for policy (use recent avg weekly demand from history)
 hist_window = max(8, min(12, len(df_hist))) if not df_hist.empty else 0
 avg_weekly_demand = (df_hist["y"].tail(hist_window).mean() if hist_window > 0 else 0.0)
 avg_weekly_demand = float(avg_weekly_demand) if pd.notna(avg_weekly_demand) else 0.0
-target_inventory = avg_weekly_demand * float(woc_target)
 
-on_hand_begin, replenishments = [], []
-prev = int(init_inv)
-for _, r in df_fc.iterrows():
-    demand = int(r[forecast_label])
-    order_qty = max(int(round(target_inventory - prev)), 0)
-    on_hand_begin.append(int(prev))
-    replenishments.append(order_qty)
-    prev = max(prev + order_qty - demand, 0)
+# Base-stock (Order-Up-To) level: S = (LeadTime + WOC) * rate
+base_stock_level = (lead_time_weeks + float(woc_target)) * (avg_weekly_demand if avg_weekly_demand > 0 else df_fc[forecast_label].mean())
+
+# Simulate week-by-week with pipeline deliveries arriving after lead_time_weeks
+on_hand_begin = []
+po_units = []
+pipeline_receipts = [0] * (periods + lead_time_weeks + 5)  # buffer
+on_hand = int(start_on_hand)
+
+for t in range(periods):
+    wk = df_fc.iloc[t]
+    demand_t = int(wk[forecast_label])
+
+    # Deliveries arriving this week from past POs
+    arriving = int(pipeline_receipts[t]) if t < len(pipeline_receipts) else 0
+    on_hand += arriving
+
+    # Inventory position (on hand + open POs not yet arrived)
+    open_pos = sum(pipeline_receipts[t+1 : t + lead_time_weeks + 1]) if lead_time_weeks > 0 else 0
+    inventory_position = on_hand + open_pos
+
+    # Order-Up-To policy
+    order_qty = max(int(round(base_stock_level - inventory_position)), 0)
+
+    # Schedule arrival after lead time
+    if lead_time_weeks > 0 and t + lead_time_weeks < len(pipeline_receipts):
+        pipeline_receipts[t + lead_time_weeks] += order_qty
+    elif lead_time_weeks == 0:
+        on_hand += order_qty  # arrives immediately
+    # Record start on-hand and PO
+    on_hand_begin.append(int(on_hand))
+    po_units.append(int(order_qty))
+
+    # Consume this week's demand
+    on_hand = max(on_hand - demand_t, 0)
 
 df_fc["On_Hand_Begin"] = on_hand_begin
-df_fc["Replenishment"] = replenishments
+df_fc["Predicted_PO_Units"] = po_units
+df_fc["Predicted_SellIn_$"] = (df_fc["Predicted_PO_Units"] * float(unit_price)).round(2)
+
+# Weeks of cover based on sell-out forecast
 df_fc["Weeks_Of_Cover"] = np.where(
     df_fc[forecast_label] > 0,
     (df_fc["On_Hand_Begin"] / df_fc[forecast_label]).round(2),
@@ -296,7 +381,7 @@ df_fc["Weeks_Of_Cover"] = np.where(
 df_fc["Date"] = pd.to_datetime(df_fc["Week_Start"]).dt.strftime("%d-%m-%Y")
 
 # ------------------------ Plot ------------------------
-st.subheader(f"{periods}-Week Forecast & Replenishment")
+st.subheader(f"{periods}-Week Forecast & Predicted POs")
 if projection_type == "Sales $":
     primary_key, primary_title = "Projected_Sales", "Sales $"
     secondary_key, secondary_title = forecast_label, "Units"
@@ -307,15 +392,15 @@ else:
 if PLOTLY_INSTALLED:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df_fc["Week_Start"], y=df_fc[primary_key],
-                             name=f"{primary_title} ({'Projected' if primary_key=='Projected_Sales' else 'Forecast'})",
+                             name=f"{primary_title} ({'Projected' if primary_key=='Projected_Sales' else 'Sell-out Forecast'})",
                              yaxis="y", line=dict(color=AMZ_ORANGE)))
-    fig.add_trace(go.Scatter(x=df_fc["Week_Start"], y=df_fc["Replenishment"],
-                             name="Replenishment Units",
+    fig.add_trace(go.Scatter(x=df_fc["Week_Start"], y=df_fc["Predicted_PO_Units"],
+                             name="Predicted PO Units (Sell-in)",
                              yaxis="y" if primary_key == forecast_label else "y2",
                              line=dict(color=AMZ_BLUE)))
     if secondary_key != primary_key:
         fig.add_trace(go.Scatter(x=df_fc["Week_Start"], y=df_fc[secondary_key],
-                                 name=f"{secondary_title} ({'Projected' if secondary_key=='Projected_Sales' else 'Forecast'})",
+                                 name=f"{secondary_title} ({'Projected' if secondary_key=='Projected_Sales' else 'Sell-out Forecast'})",
                                  yaxis="y2", line=dict(dash="dot")))
     fig.update_layout(
         xaxis=dict(title="Week"),
@@ -328,23 +413,25 @@ if PLOTLY_INSTALLED:
     fig.update_xaxes(tickformat="%d-%m-%Y")
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.line_chart(df_fc.set_index("Week_Start")[[forecast_label, "Replenishment"]])
+    st.line_chart(df_fc.set_index("Week_Start")[[forecast_label, "Predicted_PO_Units"]])
     st.line_chart(df_fc.set_index("Week_Start")["Projected_Sales"])
 
 # ------------------------ Summary + Detail ------------------------
 st.subheader("Summary Metrics")
-total_rep = int(df_fc["Replenishment"].sum())
-total_sales = float(df_fc["Projected_Sales"].sum())
-avg_sales = float(df_fc["Projected_Sales"].mean())
+total_po_units = int(df_fc["Predicted_PO_Units"].sum())
+total_sellin = float(df_fc["Predicted_SellIn_$"].sum())
+avg_sellin = float(df_fc["Predicted_SellIn_$"].mean())
 recap = pd.DataFrame({
-    "Metric": ["Total Replenishment Units", "Total Projected Sales $", "Avg Weekly Sales $"],
-    "Value": [f"{total_rep:,}", f"${total_sales:,.2f}", f"${avg_sales:,.2f}"]
+    "Metric": ["Total Predicted PO Units", "Total Predicted Sell-In $", "Avg Weekly Sell-In $"],
+    "Value": [f"{total_po_units:,}", f"${total_sellin:,.2f}", f"${avg_sellin:,.2f}"]
 })
 st.table(recap)
 
 st.subheader("Detailed Plan")
-st.dataframe(df_fc[["Date", forecast_label, "Projected_Sales", "On_Hand_Begin", "Replenishment", "Weeks_Of_Cover"]],
-             use_container_width=True)
+st.dataframe(
+    df_fc[["Date", forecast_label, "Projected_Sales", "On_Hand_Begin", "Predicted_PO_Units", "Predicted_SellIn_$", "Weeks_Of_Cover"]],
+    use_container_width=True
+)
 
 st.markdown(
     f"<div style='text-align:center;color:gray;margin-top:20px;'>&copy; {datetime.now().year} Amazon Internal Tool</div>",
