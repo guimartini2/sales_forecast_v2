@@ -1,8 +1,7 @@
 """
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
-Targeted fixes ONLY:
-1) SALES loader: robust 'Week' column detection (case/whitespace/variants) to avoid zeroed history
-2) AMAZON override: align by joining both model and Amazon onto a horizon index, then coalesce
+Targeted fix ONLY:
+- Amazon override alignment: use PeriodIndex('W-MON') to align weeks; if no overlap, reindex Amazon directly to horizon.
 """
 
 import os
@@ -150,25 +149,19 @@ def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
         next_mon = next_mon + pd.offsets.Week(weekday=0)
     return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
 
-# ------------------------ SALES LOADER (FIXED detection) ------------------------
+# ------------------------ SALES LOADER (as before) ------------------------
 def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Prefer 'long' table with a Week column (various spellings/cases).
-    If not found, fallback to wide-columns melt.
-    """
     week_regex = re.compile(r"^\s*week\s*$|^week\s+of|^week\s*start|^week\s*begin", re.I)
     for skip in (1, 0, 2, 3, 4, 5, 6):
         try:
             _maybe_seek_start(src)
             df = pd.read_csv(src, sep=None, engine="python", skiprows=skip)
-            # Find a week-like column (not strict equality)
             week_col = None
             for c in df.columns:
                 if week_regex.search(str(c)):
                     week_col = c; break
             if week_col is None:
                 continue
-            # Units column preference
             units_col = None
             for cand in ["Shipped Units", "Ordered Units"]:
                 if cand in df.columns:
@@ -189,7 +182,6 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         except Exception:
             continue
 
-    # Fallback: wide columns
     _maybe_seek_start(src)
     df = pd.read_csv(src, sep=None, engine="python")
     prefer_year = datetime.now().year
@@ -319,25 +311,33 @@ df_fc[forecast_label] = pd.Series(df_fc["yhat"]).clip(lower=0).round().astype(in
 
 # ------------------------ Amazon override (FIXED alignment) ------------------------
 if not df_up.empty:
-    # Normalize Amazon weeks to W-MON
+    # Normalize to PeriodIndex(W-MON)
     df_up = df_up.copy()
-    df_up["Week_Start"] = pd.to_datetime(df_up["Week_Start"]).dt.to_period("W-MON").dt.start_time
+    df_up["Week_Start"] = pd.to_datetime(df_up["Week_Start"]).dt.to_period("W-MON")
 
-    # Build the horizon grid
+    model = df_fc[["Week_Start", forecast_label]].copy()
+    model["Week_Start"] = pd.to_datetime(model["Week_Start"]).dt.to_period("W-MON")
+
     start_from = future_weeks_after(max(last_week, today), 1)[0]
-    horizon = pd.date_range(start=start_from, periods=periods, freq="W-MON")
+    horizon = pd.period_range(start=pd.to_datetime(start_from).to_period("W-MON"), periods=periods, freq="W-MON")
     grid = pd.DataFrame({"Week_Start": horizon})
 
-    # Normalize model weeks too
-    model = df_fc[["Week_Start", forecast_label]].copy()
-    model["Week_Start"] = pd.to_datetime(model["Week_Start"]).dt.to_period("W-MON").dt.start_time
-
-    # LEFT join grid ← model, grid ← amazon; then coalesce
+    # Join both onto grid (by PeriodIndex), then coalesce
     merged = grid.merge(model, on="Week_Start", how="left").merge(
         df_up.rename(columns={"Amazon_Sellout_Forecast": "AmazonOverride"}), on="Week_Start", how="left"
     )
+    overlap = int(merged["AmazonOverride"].notna().sum())
     merged[forecast_label] = merged["AmazonOverride"].fillna(merged[forecast_label]).fillna(0).astype(int)
 
+    # SAFEGUARD: if no overlap but Amazon has data, reindex Amazon directly to horizon
+    if overlap == 0 and up_meta.get("sum", 0) > 0:
+        amazon_only = pd.DataFrame({"Week_Start": df_up["Week_Start"], forecast_label: df_up["Amazon_Sellout_Forecast"]})
+        amazon_only = amazon_only.set_index("Week_Start").reindex(horizon, fill_value=0).reset_index()
+        amazon_only.rename(columns={"index": "Week_Start"}, inplace=True)
+        merged = amazon_only
+
+    # Back to timestamps for display
+    merged["Week_Start"] = merged["Week_Start"].dt.start_time
     df_fc = merged[["Week_Start", forecast_label]].copy()
 else:
     st.warning("⚠️ Amazon sell-out forecast file parsed with 0 week columns or was missing; not overriding.")
