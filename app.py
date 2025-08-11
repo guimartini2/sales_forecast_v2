@@ -1,10 +1,9 @@
 """
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
-Targeted changes:
-- Sales loader: semicolon + 3rd column units (previous fix)
-- Amazon forecast loader: NEW fallback for files with weeks on line 2 and units on line 3
-
-Rest of the app (alignment, PO policy with lead time, plots) unchanged.
+Changes in this revision:
+- Hide Prophet/ARIMA object dumps by avoiding any direct reference to class objects in Streamlit context.
+  (Switched model detection to boolean flags; no st.write/help of classes anywhere.)
+- Everything else remains as in the previous version.
 """
 
 import os
@@ -15,7 +14,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional libs
+# ------------------------ Optional libs ------------------------
 PLOTLY_INSTALLED = False
 try:
     import plotly.graph_objects as go
@@ -25,28 +24,28 @@ except ImportError:
 
 PROPHET_INSTALLED = False
 try:
-    from prophet import Prophet
+    from prophet import Prophet  # noqa: F401
     PROPHET_INSTALLED = True
 except ImportError:
     try:
-        from fbprophet import Prophet
+        from fbprophet import Prophet  # noqa: F401
         PROPHET_INSTALLED = True
     except ImportError:
         pass
 
 ARIMA_INSTALLED = False
 try:
-    from statsmodels.tsa.arima.model import ARIMA
+    from statsmodels.tsa.arima.model import ARIMA  # noqa: F401
     ARIMA_INSTALLED = True
 except ImportError:
     pass
 
-# Branding/colors
+# ------------------------ Branding ------------------------
 AMZ_LOGO = "https://upload.wikimedia.org/wikipedia/commons/a/a9/Amazon_logo.svg"
 AMZ_ORANGE = "#FF9900"
 AMZ_BLUE = "#146EB4"
 
-# Page
+# ------------------------ Page ------------------------
 st.set_page_config(page_title="Amazon Replenishment Forecast", page_icon="🛒", layout="wide")
 st.markdown(
     f"<div style='display:flex; align-items:center;'>"
@@ -56,7 +55,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Sidebar
+# ------------------------ Sidebar ------------------------
 st.sidebar.header("Data Inputs & Settings")
 sales_file = st.sidebar.file_uploader("Sales history CSV (Amazon export)", type=["csv"])
 fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV", type=["csv"])
@@ -66,19 +65,11 @@ projection_type = st.sidebar.selectbox("Projection Type (primary Y-axis)", ["Uni
 init_inv = st.sidebar.number_input("Fallback Current On-Hand Inventory (units)", min_value=0, value=26730, step=1)
 unit_price = st.sidebar.number_input("Unit Price ($)", min_value=0.0, value=10.0, step=0.01)
 
+# IMPORTANT: build model options using booleans only (prevents class objects from being rendered)
 model_opts = []
-try:
-    Prophet  # type: ignore
-    model_opts.append("Prophet")
-except Exception:
-    pass
-try:
-    ARIMA   # type: ignore
-    model_opts.append("ARIMA")
-except Exception:
-    pass
-if not model_opts:
-    model_opts.append("Naive (last value)")
+if PROPHET_INSTALLED: model_opts.append("Prophet")
+if ARIMA_INSTALLED:   model_opts.append("ARIMA")
+if not model_opts:    model_opts.append("Naive (last value)")
 model_choice = st.sidebar.selectbox("Forecast Model", model_opts)
 
 woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
@@ -90,7 +81,7 @@ if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to generate the forecast and predicted POs.")
     st.stop()
 
-# Defaults
+# ------------------------ Defaults ------------------------
 default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
 default_up    = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 sales_path = sales_file if sales_file is not None else (default_sales if os.path.exists(default_sales) else None)
@@ -170,7 +161,7 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     except Exception:
         pass
 
-    # Fallbacks (sniffed / wide)
+    # Fallbacks
     week_regex = re.compile(r"^\s*week\s*$|^week\s+of|^week\s*start|^week\s*begin", re.I)
     for skip in (1, 0, 2, 3, 4, 5, 6):
         try:
@@ -225,7 +216,7 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     prefer_year = datetime.now().year
 
-    # 1) Try standard: header inferred with skiprows sweep
+    # Standard: header inferred with skiprows sweep
     for skip in range(0, 6):
         try:
             _maybe_seek_start(src)
@@ -247,31 +238,25 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         except Exception:
             continue
 
-    # 2) NEW fallback: weeks on line 2, units on line 3+
+    # Fallback: weeks on line 2, units on line 3+
     try:
         _maybe_seek_start(src)
         raw = pd.read_csv(src, sep=None, engine="python", header=None)
         if raw.shape[0] >= 3:
-            header = raw.iloc[1].astype(str).tolist()   # line 2 => column names (weeks)
-            data   = raw.iloc[2:].copy()                # line 3+ => units
+            header = raw.iloc[1].astype(str).tolist()
+            data   = raw.iloc[2:].copy()
             data.columns = header
-
-            # pick week-like columns from header row
             week_cols = [c for c in data.columns if re.search(r"Week\s*\d+\s*\(|\(\d{1,2}\s*[A-Za-z]", str(c))]
             if week_cols:
-                # Clean numerics and sum across rows (multiple SKUs)
                 vals = data[week_cols].applymap(lambda x: re.sub(r"[^0-9\-.]", "", str(x)))
                 vals = vals.apply(pd.to_numeric, errors="coerce")
                 sums = vals.sum(axis=0, skipna=True)
-
                 recs = []
                 for col, val in sums.items():
                     dt = extract_weekstart_from_header(col, prefer_year)
                     if dt is not None and pd.notna(val):
-                        recs.append({
-                            "Week_Start": pd.to_datetime(dt).to_period("W-MON").start_time,
-                            "Amazon_Sellout_Forecast": int(round(val))
-                        })
+                        recs.append({"Week_Start": pd.to_datetime(dt).to_period("W-MON").start_time,
+                                     "Amazon_Sellout_Forecast": int(round(val))})
                 df_up = pd.DataFrame(recs).sort_values("Week_Start")
                 meta = {"mode": "2nd_row_header", "week_cols_found": len(week_cols), "rows": int(len(df_up)),
                         "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
@@ -279,7 +264,6 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     except Exception:
         pass
 
-    # 3) Give up
     return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"mode": "none", "week_cols_found": 0, "rows": 0, "sum": 0}
 
 # ------------------------ INVENTORY LOADER (optional) ------------------------
@@ -343,16 +327,17 @@ forecast_label = "Forecast_Units"
 last_week = df_hist["Week_Start"].max() if not df_hist.empty else today
 future_idx = future_weeks_after(max(last_week, today), periods)
 
-if model_choice == "Prophet" and 'Prophet' in model_opts and not df_hist.empty and df_hist["y"].sum() > 0:
-    m = Prophet(weekly_seasonality=True)
+if model_choice == "Prophet" and PROPHET_INSTALLED and not df_hist.empty and df_hist["y"].sum() > 0:
+    # Fit silently (do not display the model object)
+    m = Prophet(weekly_seasonality=True)  # type: ignore[name-defined]
     m.fit(df_hist.rename(columns={"Week_Start": "ds", "y": "y"}))
     fut = pd.DataFrame({"ds": future_idx})
     df_fc = m.predict(fut)[["ds", "yhat"]].rename(columns={"ds": "Week_Start"})
-elif model_choice == "ARIMA" and 'ARIMA' in model_opts:
+elif model_choice == "ARIMA" and ARIMA_INSTALLED:
     tmp = df_hist.set_index("Week_Start").asfreq("W-MON", fill_value=0)
     series = tmp["y"] if not tmp.empty else pd.Series([0.0], index=pd.date_range(today, periods=1, freq="W-MON"))
     try:
-        ar = ARIMA(series, order=(1, 1, 1)).fit()
+        ar = ARIMA(series, order=(1, 1, 1)).fit()  # type: ignore[name-defined]
         pr = ar.get_forecast(steps=periods)
         df_fc = pd.DataFrame({"Week_Start": future_idx, "yhat": pr.predicted_mean.values})
     except Exception:
