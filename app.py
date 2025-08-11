@@ -2,9 +2,8 @@
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
 
 This revision:
-- Adds universal loader for CSV/Excel with graceful Excel fallback.
-- If `openpyxl` is missing for .xlsx/.xls, we show a clear error and stop (no stack trace).
-- All previous fixes preserved (Amazon file authoritative for Forecast_Units, header fallbacks, hidden model objects).
+- FIX: Amazon week detection now tries to parse EVERY header; no longer requires parentheses.
+- CSV/XLSX both supported; Amazon file is authoritative for Forecast_Units.
 """
 
 import os
@@ -111,23 +110,16 @@ def get_ext(obj) -> str:
     return os.path.splitext(name)[-1].lower()
 
 def load_any_table(obj, *, sep=None, skiprows=None, header="infer", sheet_name=0):
-    """
-    Load CSV or Excel into a DataFrame. Accepts Streamlit UploadedFile or path.
-    - CSV -> pandas.read_csv
-    - Excel (.xlsx/.xls) -> pandas.read_excel (requires openpyxl)
-    Graceful error if openpyxl is missing.
-    """
     _maybe_seek_start(obj)
     ext = get_ext(obj)
     if ext in [".xlsx", ".xls"]:
         if not OPENPYXL_INSTALLED:
             st.error(
                 "Excel file detected but the 'openpyxl' engine is not installed.\n\n"
-                "Please add **openpyxl>=3.1.2** to your `requirements.txt` or upload a CSV version of the file."
+                "Please add **openpyxl>=3.1.2** to `requirements.txt` or upload a CSV instead."
             )
             st.stop()
-        return pd.read_excel(obj, sheet_name=sheet_name, header=header)  # uses openpyxl by default
-    # CSV or unknown -> use read_csv with python engine (handles odd delimiters when sep=None)
+        return pd.read_excel(obj, sheet_name=sheet_name, header=header)
     return pd.read_csv(obj, sep=sep, engine="python", skiprows=skiprows, header=header)
 
 def try_parse_date_string(s: str, prefer_year: Optional[int] = None) -> Optional[pd.Timestamp]:
@@ -201,7 +193,6 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     except Exception:
         pass
 
-    # Fallback: generic wide melt
     df = load_any_table(src, header=0)
     prefer_year = datetime.now().year
     week_cols, week_map = [], {}
@@ -221,24 +212,28 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum())}
     return out, meta
 
-# ------------------------ AMAZON FORECAST LOADER ------------------------
+# ------------------------ AMAZON FORECAST LOADER (FIXED detection) ------------------------
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     prefer_year = datetime.now().year
     ext = get_ext(src)
 
-    # Pass 1: normal header
+    # Pass 1: normal header — NEW: detect week columns by *parsing every header*
     for skip in range(0, 6):
         try:
             if ext in [".xlsx", ".xls"]:
                 df = load_any_table(src, header=0)
             else:
                 df = load_any_table(src, sep=None, skiprows=skip, header=0)
-            week_cols = [c for c in df.columns if re.search(r"Week\s*\d+\s*\(", str(c))]
+
+            # >>> FIX: consider ANY column whose header parses to a week start
+            week_map = {c: extract_weekstart_from_header(c, prefer_year) for c in df.columns}
+            week_cols = [c for c, wk in week_map.items() if wk is not None]
             if not week_cols:
                 continue
+
             id_cols = [c for c in df.columns if c not in week_cols]
             long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
-            long["Week_Start"] = long["col"].apply(lambda c: extract_weekstart_from_header(c, prefer_year))
+            long["Week_Start"] = long["col"].map(week_map)
             long.dropna(subset=["Week_Start"], inplace=True)
             long["nval"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9\-.]", "", regex=True), errors="coerce")
             df_up = long.groupby("Week_Start", as_index=False)["nval"].sum().rename(columns={"nval": "Amazon_Sellout_Forecast"})
@@ -250,7 +245,7 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         except Exception:
             continue
 
-    # Pass 2: 2nd-row header fallback (weeks on row 2, units on row 3+)
+    # Pass 2: 2nd-row header fallback (unchanged)
     try:
         if ext in [".xlsx", ".xls"]:
             df0 = load_any_table(src, header=None)
@@ -269,19 +264,18 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
                 data.columns = header
                 df = data
 
-        week_cols = [c for c in df.columns if re.search(r"Week\s*\d+\s*\(|\(\d{1,2}\s*[A-Za-z]", str(c))]
+        week_map = {c: extract_weekstart_from_header(c, prefer_year) for c in df.columns}
+        week_cols = [c for c, wk in week_map.items() if wk is not None]
         if week_cols:
             vals = df[week_cols].applymap(lambda x: re.sub(r"[^0-9\-.]", "", str(x)))
             vals = vals.apply(pd.to_numeric, errors="coerce")
             sums = vals.sum(axis=0, skipna=True)
             recs = []
             for col, val in sums.items():
-                dt = extract_weekstart_from_header(col, prefer_year)
+                dt = week_map[col]
                 if dt is not None and pd.notna(val):
-                    recs.append({
-                        "Week_Start": pd.to_datetime(dt).to_period("W-MON").start_time,
-                        "Amazon_Sellout_Forecast": int(round(val)),
-                    })
+                    recs.append({"Week_Start": pd.to_datetime(dt).to_period("W-MON").start_time,
+                                 "Amazon_Sellout_Forecast": int(round(val))})
             df_up = pd.DataFrame(recs).sort_values("Week_Start")
             meta = {"mode": "2nd_row_header", "week_cols_found": len(week_cols), "rows": int(len(df_up)),
                     "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
@@ -389,7 +383,7 @@ if not df_up.empty:
 # ------------------------ Projected $ ------------------------
 df_fc["Projected_Sales"] = (df_fc[forecast_label] * float(unit_price)).round(2)
 
-# ------------------------ Predict Weekly POs (Order-Up-To with lead time) ------------------------
+# ------------------------ Predict Weekly POs ------------------------
 hist_window = max(8, min(12, len(df_hist))) if not df_hist.empty else 0
 avg_weekly_demand = (df_hist["y"].tail(hist_window).mean() if hist_window > 0 else 0.0)
 avg_weekly_demand = float(avg_weekly_demand) if pd.notna(avg_weekly_demand) else 0.0
