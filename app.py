@@ -1,14 +1,12 @@
 """
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
 
-Modified to read .xlsx files only instead of .csv files.
-
-Fix in this revision:
-- Make Amazon Sell-Out Excel the **authoritative** source of Forecast_Units.
-  When df_up (Amazon) is non-empty, we IGNORE model output and build the horizon
-  strictly from Amazon's future weeks (trimmed to `periods` if needed).
-- Prior fixes kept: sales Excel parsing, 2nd-row Amazon header fallback,
-  no rendering of model objects in Streamlit.
+What's new in this revision:
+- Universal loader for CSV/Excel: .csv, .xlsx, .xls (works with Streamlit UploadedFile or file path)
+- Sales CSV parsing retained (semicolon + 3rd column units)
+- Amazon forecast: 2nd-row header fallback retained
+- Amazon file is AUTHORITATIVE for Forecast_Units when present
+- Hides model object dumps in Streamlit
 """
 
 import os
@@ -62,9 +60,9 @@ st.markdown(
 
 # ------------------------ Sidebar ------------------------
 st.sidebar.header("Data Inputs & Settings")
-sales_file = st.sidebar.file_uploader("Sales history Excel (Amazon export)", type=["xlsx"])
-fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast Excel", type=["xlsx"])
-inv_file   = st.sidebar.file_uploader("Amazon Inventory Excel (optional, weekly On Hand)", type=["xlsx"])
+sales_file = st.sidebar.file_uploader("Sales history (CSV/Excel)", type=["csv", "xlsx", "xls"])
+fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast (CSV/Excel)", type=["csv", "xlsx", "xls"])
+inv_file   = st.sidebar.file_uploader("Amazon Inventory (optional, CSV/Excel)", type=["csv", "xlsx", "xls"])
 
 projection_type = st.sidebar.selectbox("Projection Type (primary Y-axis)", ["Units", "Sales $"])
 init_inv = st.sidebar.number_input("Fallback Current On-Hand Inventory (units)", min_value=0, value=26730, step=1)
@@ -86,14 +84,14 @@ if not st.button("Run Forecast"):
     st.stop()
 
 # ------------------------ Defaults ------------------------
-default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.xlsx"
-default_up    = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.xlsx"
+default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
+default_up    = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 sales_path = sales_file if sales_file is not None else (default_sales if os.path.exists(default_sales) else None)
 up_path    = fcst_file  if fcst_file  is not None else (default_up    if os.path.exists(default_up)    else None)
 inv_path   = inv_file   if inv_file   is not None else None
 
 if not sales_path:
-    st.error("Sales history Excel file is required.")
+    st.error("Sales history file is required.")
     st.stop()
 
 # ------------------------ Helpers ------------------------
@@ -101,6 +99,25 @@ def _maybe_seek_start(obj) -> None:
     if hasattr(obj, "seek"):
         try: obj.seek(0)
         except Exception: pass
+
+def get_ext(obj) -> str:
+    # Works for UploadedFile (has .name) or path string
+    name = getattr(obj, "name", None) or str(obj)
+    return os.path.splitext(name)[-1].lower()
+
+def load_any_table(obj, *, sep=None, skiprows=None, header="infer", sheet_name=0):
+    """
+    Load CSV or Excel into a DataFrame. Accepts Streamlit UploadedFile or file path.
+    - CSV uses pandas.read_csv with optional sep/skiprows/header.
+    - Excel uses pandas.read_excel with optional header/sheet_name.
+    """
+    _maybe_seek_start(obj)
+    ext = get_ext(obj)
+    if ext in [".xlsx", ".xls"]:
+        # For Excel, sep is ignored; allow header positions (None/int/list) and sheet selection
+        return pd.read_excel(obj, sheet_name=sheet_name, header=header)
+    # CSV or unknown -> use read_csv with python engine (handles weird delimiters if sep=None)
+    return pd.read_csv(obj, sep=sep, engine="python", skiprows=skiprows, header=header)
 
 def try_parse_date_string(s: str, prefer_year: Optional[int] = None) -> Optional[pd.Timestamp]:
     s = str(s).strip()
@@ -147,262 +164,153 @@ def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
         next_mon = next_mon + pd.offsets.Week(weekday=0)
     return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
 
-# ------------------------ SALES LOADER (Excel format) ------------------------
+# ------------------------ SALES LOADER (semicolon + 3rd column) ------------------------
 def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    # Primary path: Amazon weekly export CSV (semicolon; skip first row of notes)
     try:
-        _maybe_seek_start(src)
-        # Try reading Excel file with different sheet names and skip rows
-        for sheet_name in [None, 0, "Sales", "Data", "Sheet1"]:
-            for skip_rows in [0, 1, 2]:
-                try:
-                    df = pd.read_excel(src, sheet_name=sheet_name, skiprows=skip_rows)
-                    df.columns = [str(c).strip() for c in df.columns]
-                    
-                    # Look for week column and units column
-                    week_col = None
-                    units_col = None
-                    
-                    # Find week column (first column or one containing "week")
-                    if len(df.columns) > 0:
-                        week_col = df.columns[0]
-                        for col in df.columns:
-                            if re.search(r"week", str(col), re.I):
-                                week_col = col
-                                break
-                    
-                    # Find units column ("Ordered Units" or 3rd column)
-                    if "Ordered Units" in df.columns:
-                        units_col = "Ordered Units"
-                    elif len(df.columns) >= 3:
-                        units_col = df.columns[2]
-                    else:
-                        continue
-                    
-                    if week_col and units_col and len(df) > 0:
-                        # Parse week starts - handle date ranges like "Week 1 - 01/01/2024"
-                        week_data = df[week_col].astype(str)
-                        week_start = []
-                        
-                        for week_str in week_data:
-                            if pd.isna(week_str) or str(week_str).strip() == 'nan':
-                                week_start.append(pd.NaT)
-                                continue
-                            
-                            # Try to extract date from various formats
-                            if " - " in str(week_str):
-                                date_part = str(week_str).split(" - ")[-1].strip()
-                            else:
-                                date_part = str(week_str).strip()
-                            
-                            parsed_date = pd.to_datetime(date_part, errors="coerce")
-                            week_start.append(parsed_date)
-                        
-                        week_start = pd.Series(week_start)
-                        
-                        # Parse units - remove non-numeric characters
-                        units = pd.to_numeric(
-                            df[units_col].astype(str).str.replace(r"[^0-9\-.]", "", regex=True), 
-                            errors="coerce"
-                        ).fillna(0)
-                        
-                        out = pd.DataFrame({
-                            "Week_Start": week_start.dt.to_period("W-MON").dt.start_time, 
-                            "y": units
-                        })
-                        out = out.dropna(subset=["Week_Start"]).groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
-                        
-                        if len(out) > 0:  # Successfully parsed data
-                            meta = {
-                                "mode": "long", 
-                                "format": "excel", 
-                                "rows": int(len(out)), 
-                                "sum_y": float(out["y"].sum()),
-                                "week_col": week_col, 
-                                "units_col": units_col,
-                                "sheet": sheet_name,
-                                "skip_rows": skip_rows
-                            }
-                            return out, meta
-                except Exception:
-                    continue
+        if get_ext(src) in [".xlsx", ".xls"]:
+            # Excel version: assume same columns but no semicolon; still skip the first info row if present
+            df = load_any_table(src, header=0)  # Excel has real headers
+            df.columns = [str(c).strip() for c in df.columns]
+            week_col = df.columns[0]
+            units_col = "Ordered Units" if "Ordered Units" in df.columns else df.columns[2]
+            week_start = pd.to_datetime(df[week_col].astype(str).str.split(" - ").str[0], errors="coerce")
+            units = pd.to_numeric(df[units_col].astype(str).str.replace(r"[^0-9\-]", "", regex=True), errors="coerce").fillna(0)
+        else:
+            df = load_any_table(src, sep=";", skiprows=1, header=0)
+            df.columns = [str(c).strip() for c in df.columns]
+            week_col = df.columns[0]
+            units_col = "Ordered Units" if "Ordered Units" in df.columns else df.columns[2]
+            week_start = pd.to_datetime(df[week_col].astype(str).str.split(" - ").str[0], errors="coerce")
+            units = pd.to_numeric(df[units_col].astype(str).str.replace(r"[^0-9\-]", "", regex=True), errors="coerce").fillna(0)
+
+        out = pd.DataFrame({"Week_Start": week_start.dt.to_period("W-MON").dt.start_time, "y": units})
+        out = out.dropna(subset=["Week_Start"]).groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
+        meta = {"mode": "long", "format": "excel" if get_ext(src) in [".xlsx", ".xls"] else "semicolon",
+                "rows": int(len(out)), "sum_y": float(out["y"].sum())}
+        return out, meta
     except Exception:
         pass
 
-    # Fallback: wide header melt (for Excel files with week columns as headers)
-    try:
-        _maybe_seek_start(src)
-        for sheet_name in [None, 0, "Sales", "Data", "Sheet1"]:
-            try:
-                df = pd.read_excel(src, sheet_name=sheet_name)
-                prefer_year = datetime.now().year
-                week_cols, week_map = [], {}
-                
-                for c in df.columns:
-                    wk = extract_weekstart_from_header(str(c), prefer_year)
-                    if wk is not None:
-                        week_cols.append(c)
-                        week_map[c] = wk
-                
-                if week_cols:
-                    id_cols = [c for c in df.columns if c not in week_cols]
-                    long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
-                    long["Week_Start"] = long["col"].map(week_map)
-                    long.dropna(subset=["Week_Start"], inplace=True)
-                    long["y"] = pd.to_numeric(
-                        long["val"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), 
-                        errors="coerce"
-                    ).fillna(0)
-                    out = long.groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
-                    meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum()), "sheet": sheet_name}
-                    return out, meta
-            except Exception:
-                continue
-    except Exception:
-        pass
-    
-    st.error("Sales Excel: No usable 'Week' column or week headers found.")
-    st.stop()
+    # Fallback: wide headers melt (CSV/Excel generic)
+    df = load_any_table(src, header=0)
+    prefer_year = datetime.now().year
+    week_cols, week_map = [], {}
+    for c in df.columns:
+        wk = extract_weekstart_from_header(c, prefer_year)
+        if wk is not None:
+            week_cols.append(c); week_map[c] = wk
+    if not week_cols:
+        st.error("Sales file: No usable 'Week' column or week headers found.")
+        st.stop()
+    id_cols = [c for c in df.columns if c not in week_cols]
+    long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
+    long["Week_Start"] = long["col"].map(week_map)
+    long.dropna(subset=["Week_Start"], inplace=True)
+    long["y"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce").fillna(0)
+    out = long.groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
+    meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum())}
+    return out, meta
 
-# ------------------------ AMAZON FORECAST LOADER (Excel format) ------------------------
+# ------------------------ AMAZON FORECAST LOADER (CSV/Excel + 2nd-row header fallback) ------------------------
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     prefer_year = datetime.now().year
-    
-    # Try different sheets and skip rows
-    for sheet_name in [None, 0, "Forecast", "Data", "Sheet1"]:
-        for skip in range(0, 6):
-            try:
-                _maybe_seek_start(src)
-                df = pd.read_excel(src, sheet_name=sheet_name, skiprows=skip)
-                
-                week_cols = [c for c in df.columns if re.search(r"Week\s*\d+\s*\(", str(c))]
-                if not week_cols:
-                    continue
-                
-                id_cols = [c for c in df.columns if c not in week_cols]
-                long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
-                long["Week_Start"] = long["col"].apply(lambda c: extract_weekstart_from_header(str(c), prefer_year))
-                long.dropna(subset=["Week_Start"], inplace=True)
-                long["nval"] = pd.to_numeric(
-                    long["val"].astype(str).str.replace(r"[^0-9\-.]", "", regex=True), 
-                    errors="coerce"
-                )
-                df_up = long.groupby("Week_Start", as_index=False)["nval"].sum().rename(columns={"nval": "Amazon_Sellout_Forecast"})
-                df_up["Amazon_Sellout_Forecast"] = df_up["Amazon_Sellout_Forecast"].round().astype(int)
-                df_up = df_up.sort_values("Week_Start")
-                
-                meta = {
-                    "skip": skip, 
-                    "mode": "normal", 
-                    "week_cols_found": len(week_cols), 
-                    "rows": int(len(df_up)),
-                    "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0,
-                    "sheet": sheet_name
-                }
-                return df_up, meta
-            except Exception:
-                continue
-    
-    # Fallback: 2nd-row headers, units on 3rd row+
-    for sheet_name in [None, 0, "Forecast", "Data", "Sheet1"]:
+    ext = get_ext(src)
+
+    # Pass 1: normal header (works for both CSV/Excel)
+    for skip in range(0, 6):
         try:
-            _maybe_seek_start(src)
-            raw = pd.read_excel(src, sheet_name=sheet_name, header=None)
-            
-            if raw.shape[0] >= 3:
-                header = raw.iloc[1].astype(str).tolist()
-                data = raw.iloc[2:].copy()
-                data.columns = header
-                
-                week_cols = [c for c in data.columns if re.search(r"Week\s*\d+\s*\(|\(\d{1,2}\s*[A-Za-z]", str(c))]
-                if week_cols:
-                    vals = data[week_cols].applymap(lambda x: re.sub(r"[^0-9\-.]", "", str(x)))
-                    vals = vals.apply(pd.to_numeric, errors="coerce")
-                    sums = vals.sum(axis=0, skipna=True)
-                    
-                    recs = []
-                    for col, val in sums.items():
-                        dt = extract_weekstart_from_header(str(col), prefer_year)
-                        if dt is not None and pd.notna(val):
-                            recs.append({
-                                "Week_Start": pd.to_datetime(dt).to_period("W-MON").start_time,
-                                "Amazon_Sellout_Forecast": int(round(val))
-                            })
-                    
-                    df_up = pd.DataFrame(recs).sort_values("Week_Start")
-                    meta = {
-                        "mode": "2nd_row_header", 
-                        "week_cols_found": len(week_cols), 
-                        "rows": int(len(df_up)),
-                        "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0,
-                        "sheet": sheet_name
-                    }
-                    return df_up, meta
+            if ext in [".xlsx", ".xls"]:
+                df = load_any_table(src, header=0)  # Excel: proper headers
+            else:
+                df = load_any_table(src, sep=None, skiprows=skip, header=0)
+            week_cols = [c for c in df.columns if re.search(r"Week\s*\d+\s*\(", str(c))]
+            if not week_cols:
+                continue
+            id_cols = [c for c in df.columns if c not in week_cols]
+            long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
+            long["Week_Start"] = long["col"].apply(lambda c: extract_weekstart_from_header(c, prefer_year))
+            long.dropna(subset=["Week_Start"], inplace=True)
+            long["nval"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9\-.]", "", regex=True), errors="coerce")
+            df_up = long.groupby("Week_Start", as_index=False)["nval"].sum().rename(columns={"nval": "Amazon_Sellout_Forecast"})
+            df_up["Amazon_Sellout_Forecast"] = df_up["Amazon_Sellout_Forecast"].round().astype(int)
+            df_up = df_up.sort_values("Week_Start")
+            meta = {"mode": "normal", "skip": skip, "week_cols_found": len(week_cols), "rows": int(len(df_up)),
+                    "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
+            return df_up, meta
         except Exception:
             continue
-    
+
+    # Pass 2: 2nd-row header fallback (weeks on line 2, units on line 3+)
+    try:
+        if ext in [".xlsx", ".xls"]:
+            # Excel: emulate "2nd-row header" by taking row 1 as header labels
+            df0 = load_any_table(src, header=None)
+            if df0.shape[0] >= 3:
+                header = df0.iloc[1].astype(str).tolist()   # line 2
+                data   = df0.iloc[2:].copy()                # line 3+
+                data.columns = header
+                df = data
+            else:
+                df = df0  # not enough rows, will likely fail gracefully below
+        else:
+            df = load_any_table(src, sep=None, header=None)  # CSV raw
+            if df.shape[0] >= 3:
+                header = df.iloc[1].astype(str).tolist()
+                data   = df.iloc[2:].copy()
+                data.columns = header
+                df = data
+
+        week_cols = [c for c in df.columns if re.search(r"Week\s*\d+\s*\(|\(\d{1,2}\s*[A-Za-z]", str(c))]
+        if week_cols:
+            vals = df[week_cols].applymap(lambda x: re.sub(r"[^0-9\-.]", "", str(x)))
+            vals = vals.apply(pd.to_numeric, errors="coerce")
+            sums = vals.sum(axis=0, skipna=True)
+            recs = []
+            for col, val in sums.items():
+                dt = extract_weekstart_from_header(col, prefer_year)
+                if dt is not None and pd.notna(val):
+                    recs.append({
+                        "Week_Start": pd.to_datetime(dt).to_period("W-MON").start_time,
+                        "Amazon_Sellout_Forecast": int(round(val)),
+                    })
+            df_up = pd.DataFrame(recs).sort_values("Week_Start")
+            meta = {"mode": "2nd_row_header", "week_cols_found": len(week_cols), "rows": int(len(df_up)),
+                    "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
+            return df_up, meta
+    except Exception:
+        pass
+
     return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"mode": "none", "week_cols_found": 0, "rows": 0, "sum": 0}
 
-# ------------------------ INVENTORY LOADER (Excel format) ------------------------
+# ------------------------ INVENTORY LOADER (optional) ------------------------
 def read_inventory_onhand(src) -> Optional[int]:
     today = pd.to_datetime(datetime.now().date())
-    
-    for sheet_name in [None, 0, "Inventory", "Data", "Sheet1"]:
-        for skip in (0, 1, 2, 3, 4, 5):
-            try:
-                _maybe_seek_start(src)
-                df = pd.read_excel(src, sheet_name=sheet_name, skiprows=skip)
-                
-                week_col = None
-                for c in df.columns:
-                    if re.search(r"^\s*week\s*$", str(c), re.I):
-                        week_col = c
-                        break
-                
-                if week_col is None:
-                    continue
-                
-                onhand_col = None
-                for c in df.columns:
-                    if re.search(r"on\s*hand|onhand|o/h|inventory", str(c), re.I):
-                        onhand_col = c
-                        break
-                
-                if onhand_col is None:
-                    continue
-                
-                # Parse week data - handle date ranges
-                week_data = df[week_col].astype(str)
-                wk_parsed = []
-                for week_str in week_data:
-                    if pd.isna(week_str) or str(week_str).strip() == 'nan':
-                        wk_parsed.append(pd.NaT)
-                        continue
-                    
-                    if " - " in str(week_str):
-                        date_part = str(week_str).split(" - ")[0].strip()
-                    else:
-                        date_part = str(week_str).strip()
-                    
-                    wk_parsed.append(pd.to_datetime(date_part, errors="coerce"))
-                
-                wk = pd.Series(wk_parsed)
-                oh = pd.to_numeric(
-                    df[onhand_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), 
-                    errors="coerce"
-                )
-                
-                tmp = pd.DataFrame({
-                    "Week_Start": wk.dt.to_period("W-MON").dt.start_time, 
-                    "OH": oh
-                })
-                tmp = tmp.dropna(subset=["Week_Start", "OH"])
-                tmp = tmp[tmp["Week_Start"] <= today].sort_values("Week_Start")
-                
-                if not tmp.empty:
-                    return int(tmp["OH"].iloc[-1])
-            except Exception:
+    for skip in (0, 1, 2, 3, 4, 5):
+        try:
+            df = load_any_table(src, sep=None, skiprows=skip, header=0)
+            week_col = None
+            for c in df.columns:
+                if re.search(r"^\s*week\s*$", str(c), re.I):
+                    week_col = c; break
+            if week_col is None:
                 continue
-    
+            onhand_col = None
+            for c in df.columns:
+                if re.search(r"on\s*hand|onhand|o/h|inventory", str(c), re.I):
+                    onhand_col = c; break
+            if onhand_col is None:
+                continue
+            wk = pd.to_datetime(df[week_col].astype(str).str.split(" - ").str[0], errors="coerce")
+            oh = pd.to_numeric(df[onhand_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+            tmp = pd.DataFrame({"Week_Start": wk.dt.to_period("W-MON").dt.start_time, "OH": oh})
+            tmp = tmp.dropna(subset=["Week_Start", "OH"])
+            tmp = tmp[tmp["Week_Start"] <= today].sort_values("Week_Start")
+            if tmp.empty:
+                continue
+            return int(tmp["OH"].iloc[-1])
+        except Exception:
+            continue
     return None
 
 # ------------------------ Load & reshape ------------------------
@@ -421,7 +329,6 @@ if inv_path:
     init_inv_override = read_inventory_onhand(inv_path)
 start_on_hand = int(init_inv_override) if init_inv_override is not None else int(init_inv)
 
-# (Keep small debug, can collapse)
 with st.expander("Debug: parsing summary", expanded=False):
     st.json({
         "sales_meta": sales_meta,
@@ -463,11 +370,10 @@ amazon_drives = False
 if not df_up.empty:
     amazon = df_up.copy()
     amazon["Week_Start"] = pd.to_datetime(amazon["Week_Start"]).dt.to_period("W-MON")
-    # Future weeks only, sorted
     start_from = future_weeks_after(max(last_week, today), 1)[0].to_period("W-MON")
     amazon = amazon[amazon["Week_Start"] >= start_from].sort_values("Week_Start")
     if not amazon.empty:
-        amazon = amazon.head(periods)  # respect selected horizon
+        amazon = amazon.head(periods)
         df_fc = amazon.rename(columns={"Amazon_Sellout_Forecast": forecast_label})[["Week_Start", forecast_label]]
         df_fc["Week_Start"] = df_fc["Week_Start"].dt.start_time
         amazon_drives = True
@@ -476,7 +382,6 @@ if not df_up.empty:
 df_fc["Projected_Sales"] = (df_fc[forecast_label] * float(unit_price)).round(2)
 
 # ------------------------ Predict Weekly POs (Order-Up-To with lead time) ------------------------
-# Demand baseline MUST be Forecast_Units (now = Amazon when available)
 hist_window = max(8, min(12, len(df_hist))) if not df_hist.empty else 0
 avg_weekly_demand = (df_hist["y"].tail(hist_window).mean() if hist_window > 0 else 0.0)
 avg_weekly_demand = float(avg_weekly_demand) if pd.notna(avg_weekly_demand) else 0.0
