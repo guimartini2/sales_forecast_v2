@@ -1,12 +1,8 @@
 """
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
-Targeted changes only:
-- NEW: Optional Inventory CSV loader (Week + On Hand Units)
-- NEW: Lead time (weeks) control
-- NEW: Order-Up-To policy that predicts weekly PO units with delivery after lead time
-- Renames replenishment outputs to Predicted_PO_Units and Predicted_SellIn_$
-
-Everything else (file parsing, charts, Prophet/ARIMA, Amazon forecast override, UI) is unchanged.
+Targeted fixes ONLY:
+1) SALES loader: robust 'Week' column detection (case/whitespace/variants) to avoid zeroed history
+2) AMAZON override: align by joining both model and Amazon onto a horizon index, then coalesce
 """
 
 import os
@@ -61,23 +57,30 @@ st.markdown(
 # Sidebar
 st.sidebar.header("Data Inputs & Settings")
 sales_file = st.sidebar.file_uploader("Sales history CSV (Amazon export)", type=["csv"])
-fcst_file = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV (wide)", type=["csv"])
-# NEW: Inventory CSV upload (weekly On Hand)
-inv_file  = st.sidebar.file_uploader("Amazon Inventory CSV (optional, weekly On Hand)", type=["csv"])
+fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV (wide)", type=["csv"])
+inv_file   = st.sidebar.file_uploader("Amazon Inventory CSV (optional, weekly On Hand)", type=["csv"])
 
 projection_type = st.sidebar.selectbox("Projection Type (primary Y-axis)", ["Units", "Sales $"])
 init_inv = st.sidebar.number_input("Fallback Current On-Hand Inventory (units)", min_value=0, value=26730, step=1)
 unit_price = st.sidebar.number_input("Unit Price ($)", min_value=0.0, value=10.0, step=0.01)
 
 model_opts = []
-if PROPHET_INSTALLED: model_opts.append("Prophet")
-if ARIMA_INSTALLED:   model_opts.append("ARIMA")
-if not model_opts:    model_opts.append("Naive (last value)")
+try:
+    Prophet  # type: ignore
+    model_opts.append("Prophet")
+except Exception:
+    pass
+try:
+    ARIMA   # type: ignore
+    model_opts.append("ARIMA")
+except Exception:
+    pass
+if not model_opts:
+    model_opts.append("Naive (last value)")
 model_choice = st.sidebar.selectbox("Forecast Model", model_opts)
 
 woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
 periods = int(st.sidebar.number_input("Forecast Horizon (weeks)", min_value=4, max_value=52, value=12))
-# NEW: lead time
 lead_time_weeks = int(st.sidebar.number_input("Lead Time (weeks) — PO arrival delay", min_value=0, max_value=26, value=2))
 
 st.markdown("---")
@@ -85,12 +88,12 @@ if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to generate the forecast and predicted POs.")
     st.stop()
 
-# Defaults (paths from your session)
+# Defaults
 default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2025_8-6-2025.csv"
 default_up    = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 sales_path = sales_file if sales_file is not None else (default_sales if os.path.exists(default_sales) else None)
 up_path    = fcst_file  if fcst_file  is not None else (default_up    if os.path.exists(default_up)    else None)
-inv_path   = inv_file   if inv_file   is not None else None  # optional
+inv_path   = inv_file   if inv_file   is not None else None
 
 if not sales_path:
     st.error("Sales history file is required.")
@@ -147,35 +150,46 @@ def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
         next_mon = next_mon + pd.offsets.Week(weekday=0)
     return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
 
-# ------------------------ SALES LOADER (Amazon "View By = Week") ------------------------
+# ------------------------ SALES LOADER (FIXED detection) ------------------------
 def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    for skip in (1, 0, 2, 3, 4):
+    """
+    Prefer 'long' table with a Week column (various spellings/cases).
+    If not found, fallback to wide-columns melt.
+    """
+    week_regex = re.compile(r"^\s*week\s*$|^week\s+of|^week\s*start|^week\s*begin", re.I)
+    for skip in (1, 0, 2, 3, 4, 5, 6):
         try:
             _maybe_seek_start(src)
             df = pd.read_csv(src, sep=None, engine="python", skiprows=skip)
-            if "Week" not in df.columns:
+            # Find a week-like column (not strict equality)
+            week_col = None
+            for c in df.columns:
+                if week_regex.search(str(c)):
+                    week_col = c; break
+            if week_col is None:
                 continue
+            # Units column preference
             units_col = None
             for cand in ["Shipped Units", "Ordered Units"]:
                 if cand in df.columns:
                     units_col = cand; break
             if units_col is None:
                 for c in df.columns:
-                    if re.search(r"Units", str(c), re.I):
+                    if re.search(r"\bUnits?\b", str(c), re.I):
                         units_col = c; break
             if units_col is None:
                 continue
 
-            week_start = pd.to_datetime(df["Week"].astype(str).str.split(" - ").str[0], errors="coerce")
+            week_start = pd.to_datetime(df[week_col].astype(str).str.split(" - ").str[0], errors="coerce")
             vals = pd.to_numeric(df[units_col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce").fillna(0)
             out = pd.DataFrame({"Week_Start": week_start.dt.to_period("W-MON").dt.start_time, "y": vals})
             out = out.dropna(subset=["Week_Start"]).groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
-            meta = {"mode": "long", "skip": skip, "units_col": units_col, "rows": int(len(out)), "sum_y": float(out["y"].sum())}
+            meta = {"mode": "long", "skip": skip, "week_col": str(week_col), "units_col": str(units_col), "rows": int(len(out)), "sum_y": float(out["y"].sum())}
             return out, meta
         except Exception:
             continue
 
-    # Fallback: handle rare "wide" sales format
+    # Fallback: wide columns
     _maybe_seek_start(src)
     df = pd.read_csv(src, sep=None, engine="python")
     prefer_year = datetime.now().year
@@ -197,7 +211,7 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum())}
     return out, meta
 
-# ------------------------ AMAZON FORECAST LOADER (scan skiprows) ------------------------
+# ------------------------ AMAZON FORECAST LOADER ------------------------
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     prefer_year = datetime.now().year
     for skip in range(0, 6):
@@ -215,18 +229,14 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             df_up = long.groupby("Week_Start", as_index=False)["nval"].sum().rename(columns={"nval": "Amazon_Sellout_Forecast"})
             df_up["Amazon_Sellout_Forecast"] = df_up["Amazon_Sellout_Forecast"].round().astype(int)
             df_up = df_up.sort_values("Week_Start")
-            meta = {"skip": skip, "week_cols_found": len(week_cols), "rows": int(len(df_up))}
+            meta = {"skip": skip, "week_cols_found": len(week_cols), "rows": int(len(df_up)), "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
             return df_up, meta
         except Exception:
             continue
-    return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"skip": None, "week_cols_found": 0, "rows": 0}
+    return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"skip": None, "week_cols_found": 0, "rows": 0, "sum": 0}
 
-# ------------------------ INVENTORY LOADER (NEW, optional) ------------------------
+# ------------------------ INVENTORY LOADER (optional) ------------------------
 def read_inventory_onhand(src) -> Optional[int]:
-    """
-    Accepts an inventory CSV with a 'Week' column and an 'On Hand' (units) column.
-    Returns the latest on-hand value (most recent week <= today), or None if not found.
-    """
     today = pd.to_datetime(datetime.now().date())
     for skip in (0, 1, 2, 3, 4, 5):
         try:
@@ -234,7 +244,7 @@ def read_inventory_onhand(src) -> Optional[int]:
             df = pd.read_csv(src, sep=None, engine="python", skiprows=skip)
             week_col = None
             for c in df.columns:
-                if str(c).strip().lower() == "week" or re.search(r"\bweek\b", str(c), re.I):
+                if re.search(r"^\s*week\s*$", str(c), re.I):
                     week_col = c; break
             if week_col is None:
                 continue
@@ -249,7 +259,7 @@ def read_inventory_onhand(src) -> Optional[int]:
             tmp = pd.DataFrame({"Week_Start": wk.dt.to_period("W-MON").dt.start_time, "OH": oh})
             tmp = tmp.dropna(subset=["Week_Start", "OH"])
             tmp = tmp[tmp["Week_Start"] <= today].sort_values("Week_Start")
-            if tmp.empty: 
+            if tmp.empty:
                 continue
             return int(tmp["OH"].iloc[-1])
         except Exception:
@@ -267,7 +277,6 @@ up_meta = {"week_cols_found": 0}
 if up_path:
     df_up, up_meta = read_amazon_forecast_to_long(up_path)
 
-# NEW: get starting on-hand from inventory CSV if available
 init_inv_override = None
 if inv_path:
     init_inv_override = read_inventory_onhand(inv_path)
@@ -287,12 +296,12 @@ forecast_label = "Forecast_Units"
 last_week = df_hist["Week_Start"].max() if not df_hist.empty else today
 future_idx = future_weeks_after(max(last_week, today), periods)
 
-if model_choice == "Prophet" and PROPHET_INSTALLED and not df_hist.empty and df_hist["y"].sum() > 0:
+if model_choice == "Prophet" and 'Prophet' in model_opts and not df_hist.empty and df_hist["y"].sum() > 0:
     m = Prophet(weekly_seasonality=True)
     m.fit(df_hist.rename(columns={"Week_Start": "ds", "y": "y"}))
     fut = pd.DataFrame({"ds": future_idx})
     df_fc = m.predict(fut)[["ds", "yhat"]].rename(columns={"ds": "Week_Start"})
-elif model_choice == "ARIMA" and ARIMA_INSTALLED:
+elif model_choice == "ARIMA" and 'ARIMA' in model_opts:
     tmp = df_hist.set_index("Week_Start").asfreq("W-MON", fill_value=0)
     series = tmp["y"] if not tmp.empty else pd.Series([0.0], index=pd.date_range(today, periods=1, freq="W-MON"))
     try:
@@ -308,32 +317,41 @@ else:
 
 df_fc[forecast_label] = pd.Series(df_fc["yhat"]).clip(lower=0).round().astype(int)
 
-# ------------------------ Override with Amazon sell-out forecast (outer merge) ------------------------
+# ------------------------ Amazon override (FIXED alignment) ------------------------
 if not df_up.empty:
-    merged = pd.merge(df_fc[["Week_Start", forecast_label]], df_up, on="Week_Start", how="outer")
-    merged = merged.sort_values("Week_Start").reset_index(drop=True)
-    merged[forecast_label] = merged["Amazon_Sellout_Forecast"].fillna(merged[forecast_label]).fillna(0).astype(int)
+    # Normalize Amazon weeks to W-MON
+    df_up = df_up.copy()
+    df_up["Week_Start"] = pd.to_datetime(df_up["Week_Start"]).dt.to_period("W-MON").dt.start_time
+
+    # Build the horizon grid
     start_from = future_weeks_after(max(last_week, today), 1)[0]
     horizon = pd.date_range(start=start_from, periods=periods, freq="W-MON")
-    # FIX: add .dt before to_period for Series
-    merged["Week_Start"] = pd.to_datetime(merged["Week_Start"]).dt.to_period("W-MON").dt.start_time
-    merged = merged.groupby("Week_Start", as_index=False)[forecast_label].sum()
-    merged = merged.set_index("Week_Start").reindex(horizon, fill_value=0).reset_index().rename(columns={"index": "Week_Start"})
-    df_fc = merged.copy()
+    grid = pd.DataFrame({"Week_Start": horizon})
+
+    # Normalize model weeks too
+    model = df_fc[["Week_Start", forecast_label]].copy()
+    model["Week_Start"] = pd.to_datetime(model["Week_Start"]).dt.to_period("W-MON").dt.start_time
+
+    # LEFT join grid ← model, grid ← amazon; then coalesce
+    merged = grid.merge(model, on="Week_Start", how="left").merge(
+        df_up.rename(columns={"Amazon_Sellout_Forecast": "AmazonOverride"}), on="Week_Start", how="left"
+    )
+    merged[forecast_label] = merged["AmazonOverride"].fillna(merged[forecast_label]).fillna(0).astype(int)
+
+    df_fc = merged[["Week_Start", forecast_label]].copy()
 else:
     st.warning("⚠️ Amazon sell-out forecast file parsed with 0 week columns or was missing; not overriding.")
 
 # ------------------------ Projected $ ------------------------
 df_fc["Projected_Sales"] = (df_fc[forecast_label] * float(unit_price)).round(2)
 
-# ------------------------ Predict Weekly POs (NEW) ------------------------
+# ------------------------ Predict Weekly POs ------------------------
 hist_window = max(8, min(12, len(df_hist))) if not df_hist.empty else 0
 avg_weekly_demand = (df_hist["y"].tail(hist_window).mean() if hist_window > 0 else 0.0)
 avg_weekly_demand = float(avg_weekly_demand) if pd.notna(avg_weekly_demand) else 0.0
 base_stock_level = (lead_time_weeks + float(woc_target)) * (avg_weekly_demand if avg_weekly_demand > 0 else df_fc[forecast_label].mean())
 
-on_hand_begin = []
-po_units = []
+on_hand_begin, po_units = [], []
 pipeline_receipts = [0] * (periods + lead_time_weeks + 5)
 on_hand = int(start_on_hand)
 
