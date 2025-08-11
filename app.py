@@ -1,8 +1,12 @@
 """
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
-Targeted fixes:
-- Amazon override now uses a union horizon (model weeks ∪ Amazon weeks >= today)
-- Fallback uses correct column name: Amazon_Sellout_Forecast
+
+Fix in this revision:
+- Make Amazon Sell-Out CSV the **authoritative** source of Forecast_Units.
+  When df_up (Amazon) is non-empty, we IGNORE model output and build the horizon
+  strictly from Amazon's future weeks (trimmed to `periods` if needed).
+- Prior fixes kept: sales CSV parsing (semicolon + 3rd column units), 2nd-row Amazon header fallback,
+  no rendering of model objects in Streamlit.
 """
 
 import os
@@ -13,7 +17,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional libs
+# ------------------------ Optional libs ------------------------
 PLOTLY_INSTALLED = False
 try:
     import plotly.graph_objects as go
@@ -39,12 +43,12 @@ try:
 except ImportError:
     pass
 
-# Branding/colors
+# ------------------------ Branding ------------------------
 AMZ_LOGO = "https://upload.wikimedia.org/wikipedia/commons/a/a9/Amazon_logo.svg"
 AMZ_ORANGE = "#FF9900"
 AMZ_BLUE = "#146EB4"
 
-# Page
+# ------------------------ Page ------------------------
 st.set_page_config(page_title="Amazon Replenishment Forecast", page_icon="🛒", layout="wide")
 st.markdown(
     f"<div style='display:flex; align-items:center;'>"
@@ -54,7 +58,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Sidebar
+# ------------------------ Sidebar ------------------------
 st.sidebar.header("Data Inputs & Settings")
 sales_file = st.sidebar.file_uploader("Sales history CSV (Amazon export)", type=["csv"])
 fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV", type=["csv"])
@@ -68,7 +72,7 @@ model_opts = []
 if PROPHET_INSTALLED: model_opts.append("Prophet")
 if ARIMA_INSTALLED:   model_opts.append("ARIMA")
 if not model_opts:    model_opts.append("Naive (last value)")
-model_choice = st.sidebar.selectbox("Forecast Model", model_opts)
+model_choice = st.sidebar.selectbox("Forecast Model (used ONLY if Amazon file missing)", model_opts)
 
 woc_target = st.sidebar.slider("Target Weeks of Cover", 1, 12, 4)
 periods = int(st.sidebar.number_input("Forecast Horizon (weeks)", min_value=4, max_value=52, value=12))
@@ -79,7 +83,7 @@ if not st.button("Run Forecast"):
     st.info("Click 'Run Forecast' to generate the forecast and predicted POs.")
     st.stop()
 
-# Defaults
+# ------------------------ Defaults ------------------------
 default_sales = "/mnt/data/Sales_Week_Manufacturing_Retail_UnitedStates_Custom_1-1-2024_12-31-2024.csv"
 default_up    = "/mnt/data/Forecasting_ASIN_Retail_MeanForecast_UnitedStates.csv"
 sales_path = sales_file if sales_file is not None else (default_sales if os.path.exists(default_sales) else None)
@@ -159,15 +163,13 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     except Exception:
         pass
 
-    # Fallbacks omitted for brevity (unchanged from previous version) ...
-
-    # Last resort wide melt (unchanged)
+    # Fallback: wide header melt
     _maybe_seek_start(src)
     df = pd.read_csv(src, sep=None, engine="python")
     prefer_year = datetime.now().year
     week_cols, week_map = [], {}
     for c in df.columns:
-        wk = extract_weekstart_from_header(c, prefer_year); 
+        wk = extract_weekstart_from_header(c, prefer_year)
         if wk is not None:
             week_cols.append(c); week_map[c] = wk
     if not week_cols:
@@ -181,16 +183,16 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum())}
     return out, meta
 
-# ------------------------ AMAZON FORECAST LOADER (with 2nd-row header fallback) ------------------------
+# ------------------------ AMAZON FORECAST LOADER (normal + 2nd-row header fallback) ------------------------
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     prefer_year = datetime.now().year
-    # Standard pass
+    # Normal pass
     for skip in range(0, 6):
         try:
             _maybe_seek_start(src)
             df = pd.read_csv(src, sep=None, engine="python", skiprows=skip)
             week_cols = [c for c in df.columns if re.search(r"Week\s*\d+\s*\(", str(c))]
-            if not week_cols: 
+            if not week_cols:
                 continue
             id_cols = [c for c in df.columns if c not in week_cols]
             long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
@@ -205,8 +207,7 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             return df_up, meta
         except Exception:
             continue
-
-    # Fallback: header on 2nd row (weeks), units on 3rd row (unchanged)
+    # Fallback: 2nd-row headers, units on 3rd row+
     try:
         _maybe_seek_start(src)
         raw = pd.read_csv(src, sep=None, engine="python", header=None)
@@ -231,7 +232,6 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
                 return df_up, meta
     except Exception:
         pass
-
     return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"mode": "none", "week_cols_found": 0, "rows": 0, "sum": 0}
 
 # ------------------------ INVENTORY LOADER (optional) ------------------------
@@ -281,7 +281,8 @@ if inv_path:
     init_inv_override = read_inventory_onhand(inv_path)
 start_on_hand = int(init_inv_override) if init_inv_override is not None else int(init_inv)
 
-with st.expander("Debug: parsing summary"):
+# (Keep small debug, can collapse)
+with st.expander("Debug: parsing summary", expanded=False):
     st.json({
         "sales_meta": sales_meta,
         "amazon_forecast_meta": up_meta,
@@ -290,7 +291,7 @@ with st.expander("Debug: parsing summary"):
         "hist_sum": float(df_hist["y"].sum())
     })
 
-# ------------------------ Forecast ------------------------
+# ------------------------ Forecast (MODEL = FALLBACK ONLY) ------------------------
 forecast_label = "Forecast_Units"
 last_week = df_hist["Week_Start"].max() if not df_hist.empty else today
 future_idx = future_weeks_after(max(last_week, today), periods)
@@ -314,77 +315,40 @@ else:
     last_val = float(df_hist["y"].iloc[-1]) if not df_hist.empty else 0.0
     df_fc = pd.DataFrame({"Week_Start": future_idx, "yhat": np.full(len(future_idx), last_val)})
 
-df_fc[forecast_label] = pd.Series(df_fc["yhat"]).clip(lower=0).round().astype(int)
+df_fc[forecast_label] = pd.Series(df_fc.get("yhat", 0)).clip(lower=0).round().astype(int)
+df_fc["Week_Start"] = pd.to_datetime(df_fc["Week_Start"]).dt.to_period("W-MON").dt.start_time
 
-# ------------------------ Amazon override (FIXED: union horizon + correct fallback) ------------------------
+# ------------------------ AMAZON = AUTHORITATIVE FORECAST ------------------------
+amazon_drives = False
 if not df_up.empty:
-    # Normalize both to PeriodIndex(W-MON)
-    df_up = df_up.copy()
-    df_up["Week_Start"] = pd.to_datetime(df_up["Week_Start"]).dt.to_period("W-MON")
-    model = df_fc[["Week_Start", forecast_label]].copy()
-    model["Week_Start"] = pd.to_datetime(model["Week_Start"]).dt.to_period("W-MON")
-
-    # Build model horizon PeriodIndex
-    start_from_model = future_weeks_after(max(last_week, today), 1)[0]
-    model_horizon = pd.period_range(
-        start=pd.to_datetime(start_from_model).to_period("W-MON"),
-        periods=periods,
-        freq="W-MON"
-    )
-
-    # Include ALL Amazon weeks >= today (so none are dropped)
-    amazon_weeks_all = df_up["Week_Start"].unique()
-    amazon_weeks_all = pd.PeriodIndex(amazon_weeks_all, freq="W-MON")
-    amazon_weeks_future = amazon_weeks_all[amazon_weeks_all.to_timestamp() >= pd.to_datetime(today)]
-
-    # FIX 1: union of model horizon and amazon future weeks
-    union_horizon = pd.PeriodIndex(sorted(set(model_horizon.tolist()) | set(amazon_weeks_future.tolist())), freq="W-MON")
-
-    grid = pd.DataFrame({"Week_Start": union_horizon})
-
-    merged = grid.merge(model, on="Week_Start", how="left").merge(
-        df_up.rename(columns={"Amazon_Sellout_Forecast": "AmazonOverride"}), on="Week_Start", how="left"
-    )
-    overlap = int(merged["AmazonOverride"].notna().sum())
-    merged[forecast_label] = merged["AmazonOverride"].fillna(merged[forecast_label]).fillna(0).astype(int)
-
-    # If union is longer than requested 'periods', trim from the start of union
-    if len(merged) > periods:
-        merged = merged.sort_values("Week_Start").iloc[:periods].reset_index(drop=True)
-
-    # FIX 2: fallback uses the correct column name
-    if overlap == 0 and up_meta.get("sum", 0) > 0:
-        amazon_only = pd.DataFrame(
-            {"Week_Start": df_up["Week_Start"], forecast_label: df_up["Amazon_Sellout_Forecast"]}
-        )
-        amazon_only = amazon_only.set_index("Week_Start").reindex(union_horizon, fill_value=0).reset_index()
-        amazon_only.rename(columns={"index": "Week_Start"}, inplace=True)
-        if len(amazon_only) > periods:
-            amazon_only = amazon_only.sort_values("Week_Start").iloc[:periods].reset_index(drop=True)
-        merged = amazon_only
-
-    # Back to timestamps
-    merged["Week_Start"] = merged["Week_Start"].dt.start_time
-    df_fc = merged[["Week_Start", forecast_label]].copy()
-else:
-    st.warning("⚠️ Amazon sell-out forecast file parsed with 0 week columns or was missing; not overriding.")
+    amazon = df_up.copy()
+    amazon["Week_Start"] = pd.to_datetime(amazon["Week_Start"]).dt.to_period("W-MON")
+    # Future weeks only, sorted
+    start_from = future_weeks_after(max(last_week, today), 1)[0].to_period("W-MON")
+    amazon = amazon[amazon["Week_Start"] >= start_from].sort_values("Week_Start")
+    if not amazon.empty:
+        amazon = amazon.head(periods)  # respect selected horizon
+        df_fc = amazon.rename(columns={"Amazon_Sellout_Forecast": forecast_label})[["Week_Start", forecast_label]]
+        df_fc["Week_Start"] = df_fc["Week_Start"].dt.start_time
+        amazon_drives = True
 
 # ------------------------ Projected $ ------------------------
 df_fc["Projected_Sales"] = (df_fc[forecast_label] * float(unit_price)).round(2)
 
 # ------------------------ Predict Weekly POs (Order-Up-To with lead time) ------------------------
+# Demand baseline MUST be Forecast_Units (now = Amazon when available)
 hist_window = max(8, min(12, len(df_hist))) if not df_hist.empty else 0
 avg_weekly_demand = (df_hist["y"].tail(hist_window).mean() if hist_window > 0 else 0.0)
 avg_weekly_demand = float(avg_weekly_demand) if pd.notna(avg_weekly_demand) else 0.0
-base_stock_level = (lead_time_weeks + float(woc_target)) * (avg_weekly_demand if avg_weekly_demand > 0 else df_fc[forecast_label].mean())
+demand_base = df_fc[forecast_label].mean() if amazon_drives or avg_weekly_demand == 0 else avg_weekly_demand
+base_stock_level = (lead_time_weeks + float(woc_target)) * demand_base
 
 on_hand_begin, po_units = [], []
-pipeline_receipts = [0] * (periods + lead_time_weeks + 5)
+pipeline_receipts = [0] * (len(df_fc) + lead_time_weeks + 5)
 on_hand = int(start_on_hand)
 
-for t in range(periods):
-    wk = df_fc.iloc[t]
-    demand_t = int(wk[forecast_label])
+for t in range(len(df_fc)):
+    demand_t = int(df_fc.iloc[t][forecast_label])
     arriving = int(pipeline_receipts[t]) if t < len(pipeline_receipts) else 0
     on_hand += arriving
     open_pos = sum(pipeline_receipts[t+1 : t + lead_time_weeks + 1]) if lead_time_weeks > 0 else 0
@@ -410,7 +374,7 @@ df_fc["Weeks_Of_Cover"] = np.where(
 df_fc["Date"] = pd.to_datetime(df_fc["Week_Start"]).dt.strftime("%d-%m-%Y")
 
 # ------------------------ Plot ------------------------
-st.subheader(f"{periods}-Week Forecast & Predicted POs")
+st.subheader(f"{len(df_fc)}-Week Forecast & Predicted POs")
 if projection_type == "Sales $":
     primary_key, primary_title = "Projected_Sales", "Sales $"
     secondary_key, secondary_title = forecast_label, "Units"
