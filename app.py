@@ -1,12 +1,10 @@
 """
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
 
-What's new in this revision:
-- Universal loader for CSV/Excel: .csv, .xlsx, .xls (works with Streamlit UploadedFile or file path)
-- Sales CSV parsing retained (semicolon + 3rd column units)
-- Amazon forecast: 2nd-row header fallback retained
-- Amazon file is AUTHORITATIVE for Forecast_Units when present
-- Hides model object dumps in Streamlit
+This revision:
+- Adds universal loader for CSV/Excel with graceful Excel fallback.
+- If `openpyxl` is missing for .xlsx/.xls, we show a clear error and stop (no stack trace).
+- All previous fixes preserved (Amazon file authoritative for Forecast_Units, header fallbacks, hidden model objects).
 """
 
 import os
@@ -42,6 +40,14 @@ try:
     ARIMA_INSTALLED = True
 except ImportError:
     pass
+
+# Excel engine check
+OPENPYXL_INSTALLED = False
+try:
+    import openpyxl  # noqa: F401
+    OPENPYXL_INSTALLED = True
+except Exception:
+    OPENPYXL_INSTALLED = False
 
 # ------------------------ Branding ------------------------
 AMZ_LOGO = "https://upload.wikimedia.org/wikipedia/commons/a/a9/Amazon_logo.svg"
@@ -101,22 +107,27 @@ def _maybe_seek_start(obj) -> None:
         except Exception: pass
 
 def get_ext(obj) -> str:
-    # Works for UploadedFile (has .name) or path string
     name = getattr(obj, "name", None) or str(obj)
     return os.path.splitext(name)[-1].lower()
 
 def load_any_table(obj, *, sep=None, skiprows=None, header="infer", sheet_name=0):
     """
-    Load CSV or Excel into a DataFrame. Accepts Streamlit UploadedFile or file path.
-    - CSV uses pandas.read_csv with optional sep/skiprows/header.
-    - Excel uses pandas.read_excel with optional header/sheet_name.
+    Load CSV or Excel into a DataFrame. Accepts Streamlit UploadedFile or path.
+    - CSV -> pandas.read_csv
+    - Excel (.xlsx/.xls) -> pandas.read_excel (requires openpyxl)
+    Graceful error if openpyxl is missing.
     """
     _maybe_seek_start(obj)
     ext = get_ext(obj)
     if ext in [".xlsx", ".xls"]:
-        # For Excel, sep is ignored; allow header positions (None/int/list) and sheet selection
-        return pd.read_excel(obj, sheet_name=sheet_name, header=header)
-    # CSV or unknown -> use read_csv with python engine (handles weird delimiters if sep=None)
+        if not OPENPYXL_INSTALLED:
+            st.error(
+                "Excel file detected but the 'openpyxl' engine is not installed.\n\n"
+                "Please add **openpyxl>=3.1.2** to your `requirements.txt` or upload a CSV version of the file."
+            )
+            st.stop()
+        return pd.read_excel(obj, sheet_name=sheet_name, header=header)  # uses openpyxl by default
+    # CSV or unknown -> use read_csv with python engine (handles odd delimiters when sep=None)
     return pd.read_csv(obj, sep=sep, engine="python", skiprows=skiprows, header=header)
 
 def try_parse_date_string(s: str, prefer_year: Optional[int] = None) -> Optional[pd.Timestamp]:
@@ -164,13 +175,11 @@ def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
         next_mon = next_mon + pd.offsets.Week(weekday=0)
     return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
 
-# ------------------------ SALES LOADER (semicolon + 3rd column) ------------------------
+# ------------------------ SALES LOADER ------------------------
 def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    # Primary path: Amazon weekly export CSV (semicolon; skip first row of notes)
     try:
         if get_ext(src) in [".xlsx", ".xls"]:
-            # Excel version: assume same columns but no semicolon; still skip the first info row if present
-            df = load_any_table(src, header=0)  # Excel has real headers
+            df = load_any_table(src, header=0)
             df.columns = [str(c).strip() for c in df.columns]
             week_col = df.columns[0]
             units_col = "Ordered Units" if "Ordered Units" in df.columns else df.columns[2]
@@ -192,7 +201,7 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     except Exception:
         pass
 
-    # Fallback: wide headers melt (CSV/Excel generic)
+    # Fallback: generic wide melt
     df = load_any_table(src, header=0)
     prefer_year = datetime.now().year
     week_cols, week_map = [], {}
@@ -212,16 +221,16 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum())}
     return out, meta
 
-# ------------------------ AMAZON FORECAST LOADER (CSV/Excel + 2nd-row header fallback) ------------------------
+# ------------------------ AMAZON FORECAST LOADER ------------------------
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     prefer_year = datetime.now().year
     ext = get_ext(src)
 
-    # Pass 1: normal header (works for both CSV/Excel)
+    # Pass 1: normal header
     for skip in range(0, 6):
         try:
             if ext in [".xlsx", ".xls"]:
-                df = load_any_table(src, header=0)  # Excel: proper headers
+                df = load_any_table(src, header=0)
             else:
                 df = load_any_table(src, sep=None, skiprows=skip, header=0)
             week_cols = [c for c in df.columns if re.search(r"Week\s*\d+\s*\(", str(c))]
@@ -241,20 +250,19 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         except Exception:
             continue
 
-    # Pass 2: 2nd-row header fallback (weeks on line 2, units on line 3+)
+    # Pass 2: 2nd-row header fallback (weeks on row 2, units on row 3+)
     try:
         if ext in [".xlsx", ".xls"]:
-            # Excel: emulate "2nd-row header" by taking row 1 as header labels
             df0 = load_any_table(src, header=None)
             if df0.shape[0] >= 3:
-                header = df0.iloc[1].astype(str).tolist()   # line 2
-                data   = df0.iloc[2:].copy()                # line 3+
+                header = df0.iloc[1].astype(str).tolist()
+                data   = df0.iloc[2:].copy()
                 data.columns = header
                 df = data
             else:
-                df = df0  # not enough rows, will likely fail gracefully below
+                df = df0
         else:
-            df = load_any_table(src, sep=None, header=None)  # CSV raw
+            df = load_any_table(src, sep=None, header=None)
             if df.shape[0] >= 3:
                 header = df.iloc[1].astype(str).tolist()
                 data   = df.iloc[2:].copy()
