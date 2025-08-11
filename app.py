@@ -1,10 +1,10 @@
 """
 Amazon Replenishment Forecast — Predict Weekly Amazon POs (Sell-In)
-Targeted fixes:
-- Properly parse Sales CSV (semicolon-separated; units in 3rd column) to avoid zeros.
-- Keep Amazon override alignment by PeriodIndex and PO simulation logic.
+Targeted changes:
+- Sales loader: semicolon + 3rd column units (previous fix)
+- Amazon forecast loader: NEW fallback for files with weeks on line 2 and units on line 3
 
-Only the sales loader changed materially; the rest is intact from prior version.
+Rest of the app (alignment, PO policy with lead time, plots) unchanged.
 """
 
 import os
@@ -59,7 +59,7 @@ st.markdown(
 # Sidebar
 st.sidebar.header("Data Inputs & Settings")
 sales_file = st.sidebar.file_uploader("Sales history CSV (Amazon export)", type=["csv"])
-fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV (wide)", type=["csv"])
+fcst_file  = st.sidebar.file_uploader("Amazon Sell-Out Forecast CSV", type=["csv"])
 inv_file   = st.sidebar.file_uploader("Amazon Inventory CSV (optional, weekly On Hand)", type=["csv"])
 
 projection_type = st.sidebar.selectbox("Projection Type (primary Y-axis)", ["Units", "Sales $"])
@@ -152,25 +152,15 @@ def future_weeks_after(start_date, periods: int) -> pd.DatetimeIndex:
         next_mon = next_mon + pd.offsets.Week(weekday=0)
     return pd.date_range(start=next_mon, periods=periods, freq="W-MON")
 
-# ------------------------ SALES LOADER (FIXED for semicolon + 3rd column) ------------------------
+# ------------------------ SALES LOADER (semicolon + 3rd column) ------------------------
 def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """
-    Amazon 'View By = Week' export (semicolon-separated).
-    Columns: Week;Ordered Revenue;Ordered Units;Shipped Revenue;...;Shipped Units;...
-    We use the 3rd column (Ordered Units) by default.
-    """
-    # First try the known export format: sep=';', skiprows=1
     try:
         _maybe_seek_start(src)
         df = pd.read_csv(src, sep=";", engine="python", skiprows=1)
         df.columns = [str(c).strip() for c in df.columns]
-        # Week column should be the first
         week_col = df.columns[0]
-        # Prefer explicit name; else force the 3rd column position
         units_col = "Ordered Units" if "Ordered Units" in df.columns else df.columns[2]
-        # Parse week start
         week_start = pd.to_datetime(df[week_col].astype(str).str.split(" - ").str[0], errors="coerce")
-        # Clean numeric: strip any non-digit or '-' (so "1,357" -> "1357", weird "1,38" -> "138")
         units = pd.to_numeric(df[units_col].astype(str).str.replace(r"[^0-9\-]", "", regex=True), errors="coerce").fillna(0)
         out = pd.DataFrame({"Week_Start": week_start.dt.to_period("W-MON").dt.start_time, "y": units})
         out = out.dropna(subset=["Week_Start"]).groupby("Week_Start", as_index=False)["y"].sum().sort_values("Week_Start")
@@ -180,7 +170,7 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     except Exception:
         pass
 
-    # Fallbacks: older tolerant detection (case/variants)
+    # Fallbacks (sniffed / wide)
     week_regex = re.compile(r"^\s*week\s*$|^week\s+of|^week\s*start|^week\s*begin", re.I)
     for skip in (1, 0, 2, 3, 4, 5, 6):
         try:
@@ -197,7 +187,6 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
                 if cand in df.columns:
                     units_col = cand; break
             if units_col is None:
-                # take the 3rd column by position if present
                 if len(df.columns) >= 3:
                     units_col = df.columns[2]
                 else:
@@ -212,7 +201,6 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         except Exception:
             continue
 
-    # Last resort: wide columns melt (kept)
     _maybe_seek_start(src)
     df = pd.read_csv(src, sep=None, engine="python")
     prefer_year = datetime.now().year
@@ -220,8 +208,7 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     for c in df.columns:
         wk = extract_weekstart_from_header(c, prefer_year)
         if wk is not None:
-            week_cols.append(c)
-            week_map[c] = wk
+            week_cols.append(c); week_map[c] = wk
     if not week_cols:
         st.error("Sales CSV: No usable 'Week' column or week headers found.")
         st.stop()
@@ -234,9 +221,11 @@ def read_sales_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     meta = {"mode": "wide", "rows": int(len(out)), "sum_y": float(out["y"].sum())}
     return out, meta
 
-# ------------------------ AMAZON FORECAST LOADER (unchanged) ------------------------
+# ------------------------ AMAZON FORECAST LOADER (with 2nd-row header fallback) ------------------------
 def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     prefer_year = datetime.now().year
+
+    # 1) Try standard: header inferred with skiprows sweep
     for skip in range(0, 6):
         try:
             _maybe_seek_start(src)
@@ -248,17 +237,52 @@ def read_amazon_forecast_to_long(src) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             long = df.melt(id_vars=id_cols, value_vars=week_cols, var_name="col", value_name="val")
             long["Week_Start"] = long["col"].apply(lambda c: extract_weekstart_from_header(c, prefer_year))
             long.dropna(subset=["Week_Start"], inplace=True)
-            long["nval"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+            long["nval"] = pd.to_numeric(long["val"].astype(str).str.replace(r"[^0-9\-.]", "", regex=True), errors="coerce")
             df_up = long.groupby("Week_Start", as_index=False)["nval"].sum().rename(columns={"nval": "Amazon_Sellout_Forecast"})
             df_up["Amazon_Sellout_Forecast"] = df_up["Amazon_Sellout_Forecast"].round().astype(int)
             df_up = df_up.sort_values("Week_Start")
-            meta = {"skip": skip, "week_cols_found": len(week_cols), "rows": int(len(df_up)), "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
+            meta = {"skip": skip, "mode": "normal", "week_cols_found": len(week_cols), "rows": int(len(df_up)),
+                    "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
             return df_up, meta
         except Exception:
             continue
-    return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"skip": None, "week_cols_found": 0, "rows": 0, "sum": 0}
 
-# ------------------------ INVENTORY LOADER (optional, unchanged) ------------------------
+    # 2) NEW fallback: weeks on line 2, units on line 3+
+    try:
+        _maybe_seek_start(src)
+        raw = pd.read_csv(src, sep=None, engine="python", header=None)
+        if raw.shape[0] >= 3:
+            header = raw.iloc[1].astype(str).tolist()   # line 2 => column names (weeks)
+            data   = raw.iloc[2:].copy()                # line 3+ => units
+            data.columns = header
+
+            # pick week-like columns from header row
+            week_cols = [c for c in data.columns if re.search(r"Week\s*\d+\s*\(|\(\d{1,2}\s*[A-Za-z]", str(c))]
+            if week_cols:
+                # Clean numerics and sum across rows (multiple SKUs)
+                vals = data[week_cols].applymap(lambda x: re.sub(r"[^0-9\-.]", "", str(x)))
+                vals = vals.apply(pd.to_numeric, errors="coerce")
+                sums = vals.sum(axis=0, skipna=True)
+
+                recs = []
+                for col, val in sums.items():
+                    dt = extract_weekstart_from_header(col, prefer_year)
+                    if dt is not None and pd.notna(val):
+                        recs.append({
+                            "Week_Start": pd.to_datetime(dt).to_period("W-MON").start_time,
+                            "Amazon_Sellout_Forecast": int(round(val))
+                        })
+                df_up = pd.DataFrame(recs).sort_values("Week_Start")
+                meta = {"mode": "2nd_row_header", "week_cols_found": len(week_cols), "rows": int(len(df_up)),
+                        "sum": int(df_up["Amazon_Sellout_Forecast"].sum()) if not df_up.empty else 0}
+                return df_up, meta
+    except Exception:
+        pass
+
+    # 3) Give up
+    return pd.DataFrame(columns=["Week_Start", "Amazon_Sellout_Forecast"]), {"mode": "none", "week_cols_found": 0, "rows": 0, "sum": 0}
+
+# ------------------------ INVENTORY LOADER (optional) ------------------------
 def read_inventory_onhand(src) -> Optional[int]:
     today = pd.to_datetime(datetime.now().date())
     for skip in (0, 1, 2, 3, 4, 5):
@@ -342,7 +366,6 @@ df_fc[forecast_label] = pd.Series(df_fc["yhat"]).clip(lower=0).round().astype(in
 
 # ------------------------ Amazon override (alignment via PeriodIndex) ------------------------
 if not df_up.empty:
-    # Normalize to PeriodIndex(W-MON)
     df_up = df_up.copy()
     df_up["Week_Start"] = pd.to_datetime(df_up["Week_Start"]).dt.to_period("W-MON")
 
@@ -360,7 +383,7 @@ if not df_up.empty:
     merged[forecast_label] = merged["AmazonOverride"].fillna(merged[forecast_label]).fillna(0).astype(int)
 
     if overlap == 0 and up_meta.get("sum", 0) > 0:
-        amazon_only = pd.DataFrame({"Week_Start": df_up["Week_Start"], forecast_label: df_up["Amazon_Sellout_Forecast"]})
+        amazon_only = pd.DataFrame({"Week_Start": df_up["Week_Start"], forecast_label: df_up["AmazonOverride"]})
         amazon_only = amazon_only.set_index("Week_Start").reindex(horizon, fill_value=0).reset_index()
         amazon_only.rename(columns={"index": "Week_Start"}, inplace=True)
         merged = amazon_only
