@@ -6,3 +6,4 @@ prophet>=1.0    # or fbprophet>=0.7
 statsmodels>=0.13
 xgboost>=1.7
 plotly>=5.0
+openpyxl>=3.1.2
